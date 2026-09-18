@@ -21,6 +21,51 @@ impl std::fmt::Display for ReachedEOFException {
 
 impl Error for ReachedEOFException {}
 
+/// Tokens that cannot end a statement: when one sits in front of a blank line,
+/// the statement is unfinished and continues after it. `union` and friends are
+/// here for `select 1\n\nunion\n\nselect 2`, where the blank line precedes a
+/// keyword that could otherwise start a statement of its own.
+static UNFINISHED_TOKENS: &[SyntaxKind] = &[
+    SyntaxKind::COMMA,
+    SyntaxKind::UNION_KW,
+    SyntaxKind::INTERSECT_KW,
+    SyntaxKind::EXCEPT_KW,
+    SyntaxKind::ALL_KW,
+    SyntaxKind::AND_KW,
+    SyntaxKind::OR_KW,
+];
+
+/// Keywords that can only continue a statement, never start one. A blank line
+/// in front of one of these is formatting, not a statement boundary, so the
+/// current statement keeps going instead of being cut in two.
+static CONTINUATION_TOKENS: &[SyntaxKind] = &[
+    SyntaxKind::FROM_KW,
+    SyntaxKind::WHERE_KW,
+    SyntaxKind::JOIN_KW,
+    SyntaxKind::INNER_KW,
+    SyntaxKind::LEFT_KW,
+    SyntaxKind::RIGHT_KW,
+    SyntaxKind::FULL_KW,
+    SyntaxKind::CROSS_KW,
+    SyntaxKind::NATURAL_KW,
+    SyntaxKind::LATERAL_KW,
+    SyntaxKind::ON_KW,
+    SyntaxKind::USING_KW,
+    SyntaxKind::GROUP_KW,
+    SyntaxKind::HAVING_KW,
+    SyntaxKind::WINDOW_KW,
+    SyntaxKind::ORDER_KW,
+    SyntaxKind::LIMIT_KW,
+    SyntaxKind::OFFSET_KW,
+    SyntaxKind::FETCH_KW,
+    SyntaxKind::RETURNING_KW,
+    SyntaxKind::UNION_KW,
+    SyntaxKind::INTERSECT_KW,
+    SyntaxKind::EXCEPT_KW,
+    SyntaxKind::AND_KW,
+    SyntaxKind::OR_KW,
+];
+
 pub(crate) type SplitterResult = std::result::Result<(), ReachedEOFException>;
 
 pub fn source(p: &mut Splitter) -> SplitterResult {
@@ -171,7 +216,10 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                 break;
             }
             SyntaxKind::LINE_ENDING => {
-                if p.look_back(true).is_some_and(|t| t == SyntaxKind::COMMA) {
+                if p.look_back(true)
+                    .is_some_and(|t| UNFINISHED_TOKENS.contains(&t))
+                    || CONTINUATION_TOKENS.contains(&p.look_ahead(true))
+                {
                     p.advance()?;
                 } else {
                     break;
@@ -227,7 +275,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
             },
             t => match at_statement_start(t, exclude) {
                 Some(SyntaxKind::SELECT_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for policies, with for select
                         SyntaxKind::FOR_KW,
@@ -269,7 +317,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                 Some(SyntaxKind::INSERT_KW)
                 | Some(SyntaxKind::UPDATE_KW)
                 | Some(SyntaxKind::DELETE_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for create trigger
                         SyntaxKind::BEFORE_KW,
@@ -327,7 +375,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                     p.advance()?;
                 }
                 Some(SyntaxKind::CREATE_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for grant
                         SyntaxKind::GRANT_KW,

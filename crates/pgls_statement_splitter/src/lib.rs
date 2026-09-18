@@ -312,6 +312,80 @@ END;",
             .expect_statements(vec!["select 1\nfrom contact", "select 3"]);
     }
 
+    /// A blank line before a clause keyword is formatting, not a statement
+    /// boundary: the clause cannot start a statement of its own, so cutting
+    /// there reports a bogus syntax error on the tail of the query.
+    #[test]
+    fn double_newline_before_a_clause_keyword() {
+        Tester::from(
+            "select c.id, t.pattern
+  from agr_type t join codif_entry c on c.id = t.id
+
+where t.pattern not in ('a', 'b');",
+        )
+        .assert_single_statement()
+        .assert_no_errors();
+    }
+
+    #[test]
+    fn double_newline_before_other_clause_keywords() {
+        Tester::from(
+            "select id
+from contact
+
+order by id
+
+limit 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+where id = 1
+
+and name = 'x';",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+group by id
+
+having count(*) > 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "update contact set name = 'x'
+
+where id = 1
+
+returning id;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select 1
+
+union
+
+select 2;",
+        )
+        .assert_single_statement();
+    }
+
+    /// The clause exception does not swallow the next statement: a blank line
+    /// in front of anything that can start one still splits.
+    #[test]
+    fn double_newline_before_a_statement_keyword_still_splits() {
+        Tester::from(
+            "select 1 from contact
+
+select 2 from contact",
+        )
+        .expect_statements(vec!["select 1 from contact", "select 2 from contact"]);
+    }
+
     #[test]
     fn alter_column() {
         Tester::from("alter table users alter column email drop not null;")

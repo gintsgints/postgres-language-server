@@ -175,6 +175,19 @@ impl<'a> Splitter<'a> {
         }
     }
 
+    /// Like `look_back(true)`, but also steps over blank-line `LINE_ENDING`s.
+    ///
+    /// A blank line is significant to splitting, so `look_back` reports it as
+    /// the previous token; the callers that ask "what came before this
+    /// keyword?" want the previous *syntax* token instead, whether or not the
+    /// author put an empty line in between.
+    fn look_back_across_blank_lines(&self) -> Option<SyntaxKind> {
+        (0..self.current_pos)
+            .rev()
+            .find(|&idx| !self.is_trivia(idx) && self.lexed.kind(idx) != SyntaxKind::LINE_ENDING)
+            .map(|idx| self.lexed.kind(idx))
+    }
+
     fn is_trivia(&self, idx: usize) -> bool {
         match self.lexed.kind(idx) {
             k if TRIVIA_TOKENS.contains(&k) => true,
