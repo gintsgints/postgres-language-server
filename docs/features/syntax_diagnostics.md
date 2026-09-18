@@ -28,6 +28,15 @@ FROM foo;
 
 Use blank lines between complete statements instead.
 
+A blank line does not end a statement when the next line starts with a keyword that can only continue one — `FROM`, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, `LIMIT`, `RETURNING`, `UNION` and friends. Formatting a long query this way is safe:
+
+```sql
+SELECT id
+FROM foo
+
+WHERE id > 1;
+```
+
 ## Features
 
 - Postgres-compatible parsing: Uses the same parser as Postgres itself for accurate syntax validation
