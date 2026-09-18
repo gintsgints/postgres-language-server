@@ -312,6 +312,80 @@ END;",
             .expect_statements(vec!["select 1\nfrom contact", "select 3"]);
     }
 
+    /// A blank line before a clause keyword is formatting, not a statement
+    /// boundary: the clause cannot start a statement of its own, so cutting
+    /// there reports a bogus syntax error on the tail of the query.
+    #[test]
+    fn double_newline_before_a_clause_keyword() {
+        Tester::from(
+            "select c.id, t.pattern
+  from agr_type t join codif_entry c on c.id = t.id
+
+where t.pattern not in ('a', 'b');",
+        )
+        .assert_single_statement()
+        .assert_no_errors();
+    }
+
+    #[test]
+    fn double_newline_before_other_clause_keywords() {
+        Tester::from(
+            "select id
+from contact
+
+order by id
+
+limit 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+where id = 1
+
+and name = 'x';",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+group by id
+
+having count(*) > 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "update contact set name = 'x'
+
+where id = 1
+
+returning id;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select 1
+
+union
+
+select 2;",
+        )
+        .assert_single_statement();
+    }
+
+    /// The clause exception does not swallow the next statement: a blank line
+    /// in front of anything that can start one still splits.
+    #[test]
+    fn double_newline_before_a_statement_keyword_still_splits() {
+        Tester::from(
+            "select 1 from contact
+
+select 2 from contact",
+        )
+        .expect_statements(vec!["select 1 from contact", "select 2 from contact"]);
+    }
+
     #[test]
     fn alter_column() {
         Tester::from("alter table users alter column email drop not null;")
@@ -551,6 +625,56 @@ values ('insert', new.id, now());",
                 "delete from test where id = 1",
                 "select 3",
             ]);
+    }
+
+    #[test]
+    fn hstore_function_calls() {
+        let calls = [
+            "hstore(ROW(1, 2))",
+            "akeys('a=>1'::hstore)",
+            "skeys('a=>1'::hstore)",
+            "avals('a=>1'::hstore)",
+            "svals('a=>1'::hstore)",
+            "hstore_to_array('a=>1'::hstore)",
+            "hstore_to_matrix('a=>1'::hstore)",
+            "hstore_to_json('a=>1'::hstore)",
+            "hstore_to_jsonb('a=>1'::hstore)",
+            "hstore_to_json_loose('a=>1'::hstore)",
+            "hstore_to_jsonb_loose('a=>1'::hstore)",
+            "slice('a=>1'::hstore, ARRAY['a'])",
+            "each('a=>1'::hstore)",
+            "exist('a=>1'::hstore, 'a')",
+            "defined('a=>1'::hstore, 'a')",
+            "delete(resource_attributes, 'gen_ai.system')",
+            "delete('a=>1,b=>2'::hstore, ARRAY['a', 'b'])",
+            "delete('a=>1,b=>2'::hstore, 'a=>1'::hstore)",
+            "DeLeTe(resource_attributes, 'gen_ai.system')",
+            "public.delete(resource_attributes, 'gen_ai.system')",
+            "delete /* hstore */ (resource_attributes, 'gen_ai.system')",
+            "populate_record(ROW(1, 2), 'f1=>42'::hstore)",
+        ];
+
+        for call in calls {
+            let statement = format!("SELECT {call};");
+            let tester = Tester::from(statement.as_str());
+            tester
+                .expect_statements(vec![statement.as_str()])
+                .assert_no_errors();
+
+            let range = tester.result.ranges[0];
+            if let Err(error) = pgls_query::parse(&statement[range]) {
+                panic!("Expected hstore function call to parse: {error}");
+            }
+        }
+
+        Tester::from(
+            "UPDATE data SET attributes = delete(attributes, 'obsolete'); DELETE FROM data;",
+        )
+        .expect_statements(vec![
+            "UPDATE data SET attributes = delete(attributes, 'obsolete');",
+            "DELETE FROM data;",
+        ])
+        .assert_no_errors();
     }
 
     #[test]
