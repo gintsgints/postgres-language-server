@@ -37,6 +37,15 @@ FROM foo
 WHERE id > 1;
 ```
 
+The same holds in the other direction: a blank line does not end a statement that is left unfinished by the line before it — a dangling clause keyword (`FROM`, `WHERE`, `VALUES`, `ORDER BY`, `SET`, …), a trailing comma, or a trailing operator.
+
+```sql
+SELECT *
+FROM
+
+customers;
+```
+
 ## Features
 
 - Postgres-compatible parsing: Uses the same parser as Postgres itself for accurate syntax validation
