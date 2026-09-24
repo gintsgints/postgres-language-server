@@ -374,6 +374,20 @@ select 2;",
         .assert_single_statement();
     }
 
+    /// A blank line *after* a dangling keyword or operator is formatting too:
+    /// the statement is waiting for the operand that follows the blank line.
+    #[test]
+    fn double_newline_after_an_unfinished_statement() {
+        Tester::from("select * from\n\ncustomers;")
+            .assert_single_statement()
+            .assert_no_errors();
+        Tester::from("select id\nfrom contact\nwhere\n\nid = 1;").assert_single_statement();
+        Tester::from("select id\nfrom contact\norder by\n\nid;").assert_single_statement();
+        Tester::from("select id\nfrom contact\nwhere id =\n\n1;").assert_single_statement();
+        Tester::from("insert into contact (id)\nvalues\n\n(1);").assert_single_statement();
+        Tester::from("update contact set\n\nname = 'x';").assert_single_statement();
+    }
+
     /// The clause exception does not swallow the next statement: a blank line
     /// in front of anything that can start one still splits.
     #[test]

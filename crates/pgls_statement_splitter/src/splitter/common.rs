@@ -22,17 +22,44 @@ impl std::fmt::Display for ReachedEOFException {
 impl Error for ReachedEOFException {}
 
 /// Tokens that cannot end a statement: when one sits in front of a blank line,
-/// the statement is unfinished and continues after it. `union` and friends are
-/// here for `select 1\n\nunion\n\nselect 2`, where the blank line precedes a
-/// keyword that could otherwise start a statement of its own.
+/// the statement is unfinished and continues after it, e.g. `select * from\n\ncustomers`.
+/// Every [`CONTINUATION_TOKENS`] keyword counts as unfinished too - see
+/// [`cannot_end_statement`] - which covers `select 1\n\nunion\n\nselect 2`,
+/// where the blank line precedes a keyword that could otherwise start a
+/// statement of its own.
 static UNFINISHED_TOKENS: &[SyntaxKind] = &[
     SyntaxKind::COMMA,
-    SyntaxKind::UNION_KW,
-    SyntaxKind::INTERSECT_KW,
-    SyntaxKind::EXCEPT_KW,
     SyntaxKind::ALL_KW,
-    SyntaxKind::AND_KW,
-    SyntaxKind::OR_KW,
+    SyntaxKind::AS_KW,
+    SyntaxKind::BY_KW,
+    SyntaxKind::SET_KW,
+    SyntaxKind::INTO_KW,
+    SyntaxKind::VALUES_KW,
+    SyntaxKind::DISTINCT_KW,
+    SyntaxKind::NOT_KW,
+    SyntaxKind::IS_KW,
+    SyntaxKind::IN_KW,
+    SyntaxKind::LIKE_KW,
+    SyntaxKind::ILIKE_KW,
+    SyntaxKind::SIMILAR_KW,
+    SyntaxKind::BETWEEN_KW,
+    // operators are always waiting for a right-hand operand
+    SyntaxKind::EQ,
+    SyntaxKind::BANG,
+    SyntaxKind::L_ANGLE,
+    SyntaxKind::R_ANGLE,
+    SyntaxKind::PLUS,
+    SyntaxKind::MINUS,
+    SyntaxKind::SLASH,
+    SyntaxKind::PERCENT,
+    SyntaxKind::CARET,
+    SyntaxKind::AMP,
+    SyntaxKind::PIPE,
+    SyntaxKind::TILDE,
+    SyntaxKind::AT,
+    SyntaxKind::COLON,
+    SyntaxKind::DOUBLE_COLON,
+    SyntaxKind::DOT,
 ];
 
 /// Keywords that can only continue a statement, never start one. A blank line
@@ -65,6 +92,13 @@ static CONTINUATION_TOKENS: &[SyntaxKind] = &[
     SyntaxKind::AND_KW,
     SyntaxKind::OR_KW,
 ];
+
+/// Whether `kind` sitting right before a blank line leaves the statement
+/// unfinished. A clause keyword cannot start a statement, so it cannot end one
+/// either: `select * from\n\ncustomers` is one statement, not two.
+fn cannot_end_statement(kind: SyntaxKind) -> bool {
+    UNFINISHED_TOKENS.contains(&kind) || CONTINUATION_TOKENS.contains(&kind)
+}
 
 pub(crate) type SplitterResult = std::result::Result<(), ReachedEOFException>;
 
@@ -216,8 +250,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                 break;
             }
             SyntaxKind::LINE_ENDING => {
-                if p.look_back(true)
-                    .is_some_and(|t| UNFINISHED_TOKENS.contains(&t))
+                if p.look_back(true).is_some_and(cannot_end_statement)
                     || CONTINUATION_TOKENS.contains(&p.look_ahead(true))
                 {
                     p.advance()?;
