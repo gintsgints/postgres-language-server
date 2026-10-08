@@ -65,8 +65,10 @@ select
   f.prosecdef as "security_definer!"
 from
   functions f
-  left join pg_namespace n on f.pronamespace = n.oid
-  left join pg_language l on f.prolang = l.oid
+  -- inner joins: a function without a namespace or language is an orphaned
+  -- catalog row. skip it instead of failing the entire schema cache load.
+  join pg_namespace n on f.pronamespace = n.oid
+  join pg_language l on f.prolang = l.oid
   left join pg_type rt on rt.oid = f.prorettype
   left join (
     select

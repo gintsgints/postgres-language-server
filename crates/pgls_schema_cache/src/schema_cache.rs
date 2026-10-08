@@ -31,41 +31,68 @@ pub struct SchemaCache {
     pub sequences: Vec<Sequence>,
 }
 
+/// Loads a non-essential part of the schema cache.
+///
+/// A failure is logged and yields an empty list, so that a single bad catalog
+/// row cannot discard the entire cache - which would disable all
+/// database-backed features, not just the one that failed to load.
+#[cfg(feature = "db")]
+macro_rules! load_lenient {
+    ($item:ty, $pool:expr) => {
+        async {
+            match <$item>::load($pool).await {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to load {} into the schema cache: {}",
+                        stringify!($item),
+                        err
+                    );
+                    Vec::new()
+                }
+            }
+        }
+    };
+}
+
 impl SchemaCache {
     #[cfg(feature = "db")]
     pub async fn load(pool: &PgPool) -> Result<SchemaCache, sqlx::Error> {
         let (
             schemas,
             tables,
+            columns,
+            versions,
             functions,
             types,
-            versions,
-            columns,
             policies,
             triggers,
             roles,
             extensions,
             indexes,
             sequences,
-        ) = futures_util::try_join!(
+        ) = futures_util::join!(
             Schema::load(pool),
             Table::load(pool),
-            Function::load(pool),
-            PostgresType::load(pool),
-            Version::load(pool),
             Column::load(pool),
-            Policy::load(pool),
-            Trigger::load(pool),
-            Role::load(pool),
-            Extension::load(pool),
-            Index::load(pool),
-            Sequence::load(pool),
-        )?;
+            Version::load(pool),
+            load_lenient!(Function, pool),
+            load_lenient!(PostgresType, pool),
+            load_lenient!(Policy, pool),
+            load_lenient!(Trigger, pool),
+            load_lenient!(Role, pool),
+            load_lenient!(Extension, pool),
+            load_lenient!(Index, pool),
+            load_lenient!(Sequence, pool),
+        );
 
-        let version = versions
-            .into_iter()
-            .next()
-            .expect("Expected at least one version row");
+        // schemas, tables and columns are what the core features are built on,
+        // so a failure there is still a hard error.
+        let schemas = schemas?;
+        let tables = tables?;
+        let columns = columns?;
+
+        let version = versions?.into_iter().next().unwrap_or_default();
 
         Ok(SchemaCache {
             schemas,
@@ -216,6 +243,34 @@ mod tests {
         SchemaCache::load(&test_db)
             .await
             .expect("Couldnt' load Schema Cache");
+    }
+
+    #[sqlx::test(migrator = "pgls_test_utils::MIGRATIONS")]
+    async fn it_loads_with_an_orphaned_catalog_row(test_db: PgPool) {
+        // a `pg_proc` row whose namespace does not exist anymore used to make the
+        // `functions` query return a null schema, which failed to decode and
+        // discarded the entire cache - including tables and columns.
+        let setup = r#"
+        CREATE TABLE public.users (id uuid PRIMARY KEY);
+
+        CREATE FUNCTION public.orphaned() RETURNS int LANGUAGE sql AS 'select 1';
+        CREATE FUNCTION public.healthy() RETURNS int LANGUAGE sql AS 'select 1';
+
+        UPDATE pg_catalog.pg_proc
+        SET pronamespace = 2147483647
+        WHERE proname = 'orphaned';
+        "#;
+
+        test_db.execute(setup).await.unwrap();
+
+        let cache = SchemaCache::load(&test_db)
+            .await
+            .expect("Couldn't load Schema Cache");
+
+        assert!(cache.tables.iter().any(|t| t.name == "users"));
+        // the orphaned row is skipped, but the other functions still load
+        assert!(cache.functions.iter().any(|f| f.name == "healthy"));
+        assert!(!cache.functions.iter().any(|f| f.name == "orphaned"));
     }
 
     #[sqlx::test(migrator = "pgls_test_utils::MIGRATIONS")]

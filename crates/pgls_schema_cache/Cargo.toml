@@ -32,6 +32,7 @@ serde_json.workspace       = true
 sqlx                       = { workspace = true, optional = true }
 strum                      = { workspace = true }
 tokio                      = { workspace = true, optional = true }
+tracing.workspace          = true
 
 [dev-dependencies]
 pgls_test_utils.workspace = true
