@@ -21,6 +21,85 @@ impl std::fmt::Display for ReachedEOFException {
 
 impl Error for ReachedEOFException {}
 
+/// Tokens that cannot end a statement: when one sits in front of a blank line,
+/// the statement is unfinished and continues after it, e.g. `select * from\n\ncustomers`.
+/// Every [`CONTINUATION_TOKENS`] keyword counts as unfinished too - see
+/// [`cannot_end_statement`] - which covers `select 1\n\nunion\n\nselect 2`,
+/// where the blank line precedes a keyword that could otherwise start a
+/// statement of its own.
+static UNFINISHED_TOKENS: &[SyntaxKind] = &[
+    SyntaxKind::COMMA,
+    SyntaxKind::ALL_KW,
+    SyntaxKind::AS_KW,
+    SyntaxKind::BY_KW,
+    SyntaxKind::SET_KW,
+    SyntaxKind::INTO_KW,
+    SyntaxKind::VALUES_KW,
+    SyntaxKind::DISTINCT_KW,
+    SyntaxKind::NOT_KW,
+    SyntaxKind::IS_KW,
+    SyntaxKind::IN_KW,
+    SyntaxKind::LIKE_KW,
+    SyntaxKind::ILIKE_KW,
+    SyntaxKind::SIMILAR_KW,
+    SyntaxKind::BETWEEN_KW,
+    // operators are always waiting for a right-hand operand
+    SyntaxKind::EQ,
+    SyntaxKind::BANG,
+    SyntaxKind::L_ANGLE,
+    SyntaxKind::R_ANGLE,
+    SyntaxKind::PLUS,
+    SyntaxKind::MINUS,
+    SyntaxKind::SLASH,
+    SyntaxKind::PERCENT,
+    SyntaxKind::CARET,
+    SyntaxKind::AMP,
+    SyntaxKind::PIPE,
+    SyntaxKind::TILDE,
+    SyntaxKind::AT,
+    SyntaxKind::COLON,
+    SyntaxKind::DOUBLE_COLON,
+    SyntaxKind::DOT,
+];
+
+/// Keywords that can only continue a statement, never start one. A blank line
+/// in front of one of these is formatting, not a statement boundary, so the
+/// current statement keeps going instead of being cut in two.
+static CONTINUATION_TOKENS: &[SyntaxKind] = &[
+    SyntaxKind::FROM_KW,
+    SyntaxKind::WHERE_KW,
+    SyntaxKind::JOIN_KW,
+    SyntaxKind::INNER_KW,
+    SyntaxKind::LEFT_KW,
+    SyntaxKind::RIGHT_KW,
+    SyntaxKind::FULL_KW,
+    SyntaxKind::CROSS_KW,
+    SyntaxKind::NATURAL_KW,
+    SyntaxKind::LATERAL_KW,
+    SyntaxKind::ON_KW,
+    SyntaxKind::USING_KW,
+    SyntaxKind::GROUP_KW,
+    SyntaxKind::HAVING_KW,
+    SyntaxKind::WINDOW_KW,
+    SyntaxKind::ORDER_KW,
+    SyntaxKind::LIMIT_KW,
+    SyntaxKind::OFFSET_KW,
+    SyntaxKind::FETCH_KW,
+    SyntaxKind::RETURNING_KW,
+    SyntaxKind::UNION_KW,
+    SyntaxKind::INTERSECT_KW,
+    SyntaxKind::EXCEPT_KW,
+    SyntaxKind::AND_KW,
+    SyntaxKind::OR_KW,
+];
+
+/// Whether `kind` sitting right before a blank line leaves the statement
+/// unfinished. A clause keyword cannot start a statement, so it cannot end one
+/// either: `select * from\n\ncustomers` is one statement, not two.
+fn cannot_end_statement(kind: SyntaxKind) -> bool {
+    UNFINISHED_TOKENS.contains(&kind) || CONTINUATION_TOKENS.contains(&kind)
+}
+
 pub(crate) type SplitterResult = std::result::Result<(), ReachedEOFException>;
 
 pub fn source(p: &mut Splitter) -> SplitterResult {
@@ -174,7 +253,9 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                 break;
             }
             SyntaxKind::LINE_ENDING => {
-                if p.look_back(true).is_some_and(|t| t == SyntaxKind::COMMA) {
+                if p.look_back(true).is_some_and(cannot_end_statement)
+                    || CONTINUATION_TOKENS.contains(&p.look_ahead(true))
+                {
                     p.advance()?;
                 } else {
                     break;
@@ -230,7 +311,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
             },
             t => match at_statement_start(t, exclude) {
                 Some(SyntaxKind::SELECT_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for policies, with for select
                         SyntaxKind::FOR_KW,
@@ -272,7 +353,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                 Some(SyntaxKind::INSERT_KW)
                 | Some(SyntaxKind::UPDATE_KW)
                 | Some(SyntaxKind::DELETE_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for create trigger
                         SyntaxKind::BEFORE_KW,
@@ -330,7 +411,7 @@ pub(crate) fn unknown(p: &mut Splitter, exclude: &[SyntaxKind]) -> SplitterResul
                     p.advance()?;
                 }
                 Some(SyntaxKind::CREATE_KW) => {
-                    let prev = p.look_back(true);
+                    let prev = p.look_back_across_blank_lines();
                     if [
                         // for grant
                         SyntaxKind::GRANT_KW,

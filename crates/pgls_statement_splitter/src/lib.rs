@@ -408,6 +408,94 @@ END;",
             .expect_statements(vec!["select 1\nfrom contact", "select 3"]);
     }
 
+    /// A blank line before a clause keyword is formatting, not a statement
+    /// boundary: the clause cannot start a statement of its own, so cutting
+    /// there reports a bogus syntax error on the tail of the query.
+    #[test]
+    fn double_newline_before_a_clause_keyword() {
+        Tester::from(
+            "select c.id, t.pattern
+  from agr_type t join codif_entry c on c.id = t.id
+
+where t.pattern not in ('a', 'b');",
+        )
+        .assert_single_statement()
+        .assert_no_errors();
+    }
+
+    #[test]
+    fn double_newline_before_other_clause_keywords() {
+        Tester::from(
+            "select id
+from contact
+
+order by id
+
+limit 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+where id = 1
+
+and name = 'x';",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select id
+from contact
+
+group by id
+
+having count(*) > 1;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "update contact set name = 'x'
+
+where id = 1
+
+returning id;",
+        )
+        .assert_single_statement();
+        Tester::from(
+            "select 1
+
+union
+
+select 2;",
+        )
+        .assert_single_statement();
+    }
+
+    /// A blank line *after* a dangling keyword or operator is formatting too:
+    /// the statement is waiting for the operand that follows the blank line.
+    #[test]
+    fn double_newline_after_an_unfinished_statement() {
+        Tester::from("select * from\n\ncustomers;")
+            .assert_single_statement()
+            .assert_no_errors();
+        Tester::from("select id\nfrom contact\nwhere\n\nid = 1;").assert_single_statement();
+        Tester::from("select id\nfrom contact\norder by\n\nid;").assert_single_statement();
+        Tester::from("select id\nfrom contact\nwhere id =\n\n1;").assert_single_statement();
+        Tester::from("insert into contact (id)\nvalues\n\n(1);").assert_single_statement();
+        Tester::from("update contact set\n\nname = 'x';").assert_single_statement();
+    }
+
+    /// The clause exception does not swallow the next statement: a blank line
+    /// in front of anything that can start one still splits.
+    #[test]
+    fn double_newline_before_a_statement_keyword_still_splits() {
+        Tester::from(
+            "select 1 from contact
+
+select 2 from contact",
+        )
+        .expect_statements(vec!["select 1 from contact", "select 2 from contact"]);
+    }
+
     #[test]
     fn alter_column() {
         Tester::from("alter table users alter column email drop not null;")
