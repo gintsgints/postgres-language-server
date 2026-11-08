@@ -1,7 +1,6 @@
 ---
 source: crates/pgls_pretty_print/tests/tests.rs
 input_file: crates/pgls_pretty_print/tests/data/multi/txid.sql
-snapshot_kind: text
 ---
 select cast('12:13:' as txid_snapshot);
 
@@ -68,8 +67,10 @@ select txid_current() >= txid_snapshot_xmin(txid_current_snapshot());
 select txid_visible_in_snapshot(txid_current(), txid_current_snapshot());
 
 select
-  cast('1000100010001000:1000100010001100:1000100010001012,1000100010001013'
-  as txid_snapshot);
+  cast(
+    '1000100010001000:1000100010001100:1000100010001012,1000100010001013'
+    as txid_snapshot
+  );
 
 select
   txid_visible_in_snapshot(
@@ -94,7 +95,8 @@ select txid_current_if_assigned() is null;
 select txid_current();
 
 select
-  txid_current_if_assigned() is not distinct from cast('txid_current' as bigint);
+  txid_current_if_assigned() is not distinct from
+  cast('txid_current' as bigint);
 
 commit;
 
@@ -133,7 +135,7 @@ begin;
 create function test_future_xid_status(bigint)
 returns void
 language plpgsql
-as $function$
+as $$
 BEGIN
   PERFORM txid_status($1);
   RAISE EXCEPTION 'didn''t ERROR at xid in the future as expected';
@@ -141,7 +143,7 @@ EXCEPTION
   WHEN invalid_parameter_value THEN
     RAISE NOTICE 'Got expected error for xid in the future';
 END;
-$function$;
+$$;
 
 select test_future_xid_status('inprogress' + 10000);
 

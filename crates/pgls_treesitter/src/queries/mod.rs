@@ -2,6 +2,7 @@ mod insert_columns;
 mod object_references;
 mod parameters;
 mod relations;
+mod returning_aliases;
 mod select_columns;
 mod table_aliases;
 mod where_columns;
@@ -12,6 +13,7 @@ pub use insert_columns::*;
 pub use object_references::*;
 pub use parameters::*;
 pub use relations::*;
+pub use returning_aliases::*;
 pub use select_columns::*;
 pub use table_aliases::*;
 pub use where_columns::*;
@@ -21,6 +23,7 @@ pub enum QueryResult<'a> {
     Relation(RelationMatch<'a>),
     Parameter(ParameterMatch<'a>),
     TableAliases(TableAliasMatch<'a>),
+    ReturningAliases(ReturningAliasMatch<'a>),
     SelectClauseColumns(SelectColumnMatch<'a>),
     InsertClauseColumns(InsertColumnMatch<'a>),
     WhereClauseColumns(WhereColumnMatch<'a>),
@@ -48,6 +51,11 @@ impl QueryResult<'_> {
             QueryResult::TableAliases(m) => {
                 let start = m.table.start_position();
                 let end = m.alias.end_position();
+                start >= range.start_point && end <= range.end_point
+            }
+            QueryResult::ReturningAliases(m) => {
+                let start = m.table.start_position();
+                let end = m.returning.end_position();
                 start >= range.start_point && end <= range.end_point
             }
             Self::SelectClauseColumns(cm) => {
@@ -140,13 +148,10 @@ impl<'a> QueryResultIter<'a> {
 impl<'a> Iterator for QueryResultIter<'a> {
     type Item = &'a QueryResult<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        let next = self.inner.next()?;
-
-        if self.range.as_ref().is_some_and(|r| !next.within_range(r)) {
-            return self.next();
-        }
-
-        Some(next)
+        // Not recursion: a statement can have any number of results outside the range.
+        let range = self.range;
+        self.inner
+            .find(|next| range.is_none_or(|range| next.within_range(range)))
     }
 }
 
@@ -344,6 +349,48 @@ on sq1.id = pt.id;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].get_schema(sql), Some("private".into()));
         assert_eq!(results[0].get_table(sql), "something");
+    }
+
+    /// Skipping the results outside the range used to recurse once per result, which
+    /// overflowed the stack on long statements.
+    #[test]
+    fn skips_many_results_outside_the_range() {
+        let tables: Vec<_> = (0..50_000).map(|i| format!("t{i}")).collect();
+        let sql = format!("select * from {};", tables.join(", "));
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&pgls_treesitter_grammar::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&sql, None).unwrap();
+
+        // The last table.
+        let start = sql.rfind("t49999").unwrap();
+        let node = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + "t49999".len())
+            .unwrap();
+        let range = node.range();
+
+        let mut executor = TreeSitterQueriesExecutor::new(tree.root_node(), &sql);
+        executor.add_query_results::<RelationMatch>();
+
+        // On a thread with the 2 MiB stack of the language server's tokio workers.
+        let tables = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    executor
+                        .get_iter(Some(&range))
+                        .filter_map(|q| <&RelationMatch>::try_from(q).ok())
+                        .map(|relation| relation.get_table(&sql))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert_eq!(tables, ["t49999"]);
     }
 
     #[test]

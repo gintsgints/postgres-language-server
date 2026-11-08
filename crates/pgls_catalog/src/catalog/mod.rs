@@ -22,7 +22,9 @@ use std::sync::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Candidates;
-use crate::lookup::{CatalogView, FunctionInfo, Lookup, RelationInfo, TypeInfo};
+use crate::lookup::{
+    CatalogView, FunctionInfo, IndexInfo, Lookup, RelationInfo, RelationKind, TypeInfo,
+};
 use crate::typing::TypeId;
 use crate::{CastInfo, OperatorInfo, OperatorKind};
 
@@ -58,12 +60,23 @@ pub struct Catalog {
     functions: FxHashMap<Key, Entry<Vec<FunctionInfo>>>,
     /// Inheritance children and partitions created by the file, by parent.
     children: FxHashMap<Key, Vec<Key>>,
+    indexes: FxHashMap<Key, Entry<IndexInfo>>,
+    /// Set once the file may have created an index whose name we don't know: one with a
+    /// generated name, or one that comes with a constraint or a partition. From then on, no
+    /// index is known to be missing.
+    indexes_incomplete: bool,
     /// Set once the file changed the columns of a database table. Its partitions and
     /// inheritance children in the database changed too, but we don't know which they are.
     database_columns_changed: bool,
     /// Set once the file ran a statement with effects the catalog can't model (`DO`, `CALL`,
     /// `CREATE EXTENSION` of a new extension, ...). From then on, nothing is known to be missing.
     tainted: bool,
+    /// Whether the last statement was a no-op because of `IF NOT EXISTS`: the object it would
+    /// create is known to exist. See [`Catalog::skipped_existing`].
+    skipped_existing: bool,
+    /// Whether lookups ignore [`Catalog::tainted`], for editor features. See
+    /// [`Catalog::best_effort`].
+    best_effort: bool,
     casts_incomplete: bool,
     operators_incomplete: bool,
     /// The catalog at the start of each open transaction and savepoint, restored on
@@ -90,8 +103,12 @@ impl Catalog {
             types: FxHashMap::default(),
             functions: FxHashMap::default(),
             children: FxHashMap::default(),
+            indexes: FxHashMap::default(),
+            indexes_incomplete: false,
             database_columns_changed: false,
             tainted: false,
+            skipped_existing: false,
+            best_effort: false,
             casts_incomplete: false,
             operators_incomplete: false,
             savepoints: Vec::new(),
@@ -120,9 +137,25 @@ impl Catalog {
         self.tainted = true;
     }
 
+    /// A catalog for editor features like hover and semantic tokens, which show what a name most
+    /// likely refers to rather than reporting errors. Statements whose effects the catalog can't
+    /// follow (`DO`, `CALL`, a statement that doesn't parse, ...) don't make its lookups unknown:
+    /// it keeps answering from the database and the statements it could follow. It still only
+    /// finds objects that exist there. Never use it for findings, which must be certain.
+    pub fn best_effort(mut self) -> Self {
+        self.best_effort = true;
+        self
+    }
+
+    /// Whether lookups have to treat what they don't find as unknown, because the file ran a
+    /// statement the catalog can't model.
+    fn lookups_tainted(&self) -> bool {
+        self.tainted && !self.best_effort
+    }
+
     /// The result of a lookup that found nothing.
     fn not_found<T>(&self) -> Lookup<T> {
-        if self.base.is_none() || self.tainted {
+        if self.base.is_none() || self.lookups_tainted() {
             Lookup::Unknown
         } else {
             Lookup::Missing
@@ -163,6 +196,30 @@ impl Catalog {
                 }
             }
             None => self.not_found(),
+        }
+    }
+
+    fn index_in(&self, schema: &str, name: &str) -> Lookup<IndexInfo> {
+        let not_found = || {
+            if self.indexes_incomplete {
+                Lookup::Unknown
+            } else {
+                self.not_found()
+            }
+        };
+        if let Some(entry) = self.indexes.get(&key(schema, name)) {
+            return match entry {
+                Entry::Dropped => not_found(),
+                entry => self.entry_lookup(entry),
+            };
+        }
+        match self.base_for(schema) {
+            Some(base) => match base.index(schema, name) {
+                Some(index) => Lookup::Found(index.clone()),
+                None if base.may_have_index(schema, name) => Lookup::Unknown,
+                None => not_found(),
+            },
+            None => not_found(),
         }
     }
 
@@ -214,6 +271,120 @@ impl Catalog {
         } else {
             self.not_found()
         }
+    }
+
+    /// Looks up the relation a `RangeVar` names. An unqualified name is looked up in the search
+    /// path.
+    pub fn relation_of(
+        &self,
+        range_var: &pgls_query::protobuf::RangeVar,
+        search_path: &[String],
+    ) -> Lookup<RelationInfo> {
+        let name = names::range_var_name(range_var);
+        self.relation(name.schema(), &name.name, search_path)
+    }
+
+    /// The schema and name of the relation a `RangeVar` names: the relation or index it resolves
+    /// to, or, if the catalog doesn't know one, where `CREATE TABLE` would create it.
+    pub fn relation_name_of(
+        &self,
+        range_var: &pgls_query::protobuf::RangeVar,
+        search_path: &[String],
+    ) -> (String, String) {
+        let name = names::range_var_name(range_var);
+        // Indexes are relations too, in their own map.
+        let in_schema = |schema: &str| match (
+            self.relation_in(schema, &name.name),
+            self.index_in(schema, &name.name),
+        ) {
+            (Lookup::Found(_), _) | (_, Lookup::Found(_)) => Lookup::Found(key(schema, &name.name)),
+            (Lookup::Unknown, _) | (_, Lookup::Unknown) => Lookup::Unknown,
+            (Lookup::Missing, Lookup::Missing) => Lookup::Missing,
+        };
+        let found = match name.schema() {
+            Some(schema) => in_schema(schema),
+            None => self.search(relation_search_path(search_path), in_schema),
+        };
+        match found.found() {
+            Some(key) => key,
+            None if range_var.relpersistence == "t" => key("pg_temp", &range_var.relname),
+            None => self.creation_key(&name, search_path),
+        }
+    }
+
+    /// The schema and name of the relation that `CREATE TABLE` creates for a `RangeVar`. Unlike
+    /// [`Catalog::relation_name_of`], this doesn't depend on the relations that exist: a
+    /// temporary table with the name doesn't capture a new permanent table. `None` for system
+    /// catalogs, where Postgres rejects new relations.
+    pub fn relation_creation_name_of(
+        &self,
+        range_var: &pgls_query::protobuf::RangeVar,
+        search_path: &[String],
+    ) -> Option<(String, String)> {
+        self.relation_creation_key(range_var, search_path)
+    }
+
+    /// Whether the last statement applied was a no-op because of `IF NOT EXISTS`, like `CREATE
+    /// TABLE IF NOT EXISTS` of a table that is known to exist. If the catalog doesn't know
+    /// whether the object exists, the statement may have created it and this is `false`.
+    pub fn skipped_existing(&self) -> bool {
+        self.skipped_existing
+    }
+
+    /// Whether the relation a `RangeVar` names is known to be a partitioned table.
+    pub fn is_partitioned_table(
+        &self,
+        range_var: &pgls_query::protobuf::RangeVar,
+        search_path: &[String],
+    ) -> bool {
+        self.relation_of(range_var, search_path)
+            .found()
+            .is_some_and(|relation| relation.kind == RelationKind::PartitionedTable)
+    }
+
+    /// Looks up an index. With `schema: None`, the search path is used, like for relations.
+    pub fn index(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        search_path: &[String],
+    ) -> Lookup<IndexInfo> {
+        match schema {
+            Some(schema) => self.index_in(schema, name),
+            None => self.search(relation_search_path(search_path), |schema| {
+                self.index_in(schema, name)
+            }),
+        }
+    }
+
+    /// Looks up the index that a name list names, like the objects of `DROP INDEX`.
+    pub fn index_of(
+        &self,
+        names: &[pgls_query::protobuf::Node],
+        search_path: &[String],
+    ) -> Lookup<IndexInfo> {
+        match names::qualified_name(names) {
+            Some(name) => self.index(name.schema(), &name.name, search_path),
+            None => Lookup::Unknown,
+        }
+    }
+
+    /// Looks up the table or materialized view an index is on.
+    pub fn index_table(&self, index: &IndexInfo) -> Lookup<RelationInfo> {
+        self.relation_in(&index.schema, &index.table)
+    }
+
+    /// Whether the index that a name list names is known to be on a partitioned table, which
+    /// makes it a partitioned index.
+    pub fn is_partitioned_index(
+        &self,
+        names: &[pgls_query::protobuf::Node],
+        search_path: &[String],
+    ) -> bool {
+        self.index_of(names, search_path)
+            .found()
+            .and_then(|index| self.index_table(&index).found())
+            .is_some_and(|table| table.kind == RelationKind::PartitionedTable)
     }
 
     /// Finds the schema of a relation, if the relation is known to exist.
@@ -385,7 +556,7 @@ impl CatalogView for Catalog {
         let Some(base) = self.base.as_ref() else {
             return Lookup::Unknown;
         };
-        if self.tainted || self.casts_incomplete {
+        if self.lookups_tainted() || self.casts_incomplete {
             return Lookup::Unknown;
         }
         base.cast(source, target)
@@ -411,7 +582,7 @@ impl CatalogView for Catalog {
             None => function_search_path(search_path).collect(),
         };
         let mut items = Vec::new();
-        let mut complete = !self.tainted
+        let mut complete = !self.lookups_tainted()
             && self
                 .base
                 .as_ref()
@@ -460,7 +631,7 @@ impl CatalogView for Catalog {
             .collect();
         Candidates {
             items,
-            complete: !self.tainted
+            complete: !self.lookups_tainted()
                 && !self.operators_incomplete
                 && base.snapshot().typing_metadata,
         }

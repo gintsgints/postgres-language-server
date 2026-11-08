@@ -1,7 +1,7 @@
 use crate::{
     TokenKind,
     emitter::{EventEmitter, GroupKind, LineType},
-    nodes::node_list::emit_comma_separated_list,
+    nodes::node_list::{emit_comma_separated_list, emit_parenthesized_list},
 };
 use pgls_query::{NodeEnum, protobuf::RangeTableFunc};
 
@@ -21,10 +21,8 @@ pub(super) fn emit_range_table_func(e: &mut EventEmitter, n: &RangeTableFunc) {
     // XMLNAMESPACES clause - emitted before row expression
     // Namespaces are stored as ResTarget nodes with name=prefix, val=URI
     if !n.namespaces.is_empty() {
-        e.line(LineType::SoftOrSpace);
         e.token(TokenKind::XMLNAMESPACES_KW);
-        e.token(TokenKind::L_PAREN);
-        emit_comma_separated_list(e, &n.namespaces, |node, emitter| {
+        emit_parenthesized_list(e, &n.namespaces, |node, emitter| {
             // Each namespace is a ResTarget with val=URI, name=prefix
             // If name is empty, it's a DEFAULT namespace
             if let Some(NodeEnum::ResTarget(rt)) = node.node.as_ref() {
@@ -49,14 +47,15 @@ pub(super) fn emit_range_table_func(e: &mut EventEmitter, n: &RangeTableFunc) {
                 super::emit_node(node, emitter);
             }
         });
-        e.token(TokenKind::R_PAREN);
         e.token(TokenKind::COMMA);
     }
 
     // Row expression (XPath for rows)
     // Wrap complex expressions in parentheses to keep them together
     if let Some(ref rowexpr) = n.rowexpr {
-        e.line(LineType::SoftOrSpace);
+        if !n.namespaces.is_empty() {
+            e.line(LineType::SoftOrSpace);
+        }
         // Check if rowexpr is a complex expression that needs wrapping
         let needs_parens = matches!(
             rowexpr.node.as_ref(),

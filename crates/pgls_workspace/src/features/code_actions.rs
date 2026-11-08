@@ -1,11 +1,28 @@
+//! The code actions offered at the cursor, and the commands and fixes they run: lint fixes and
+//! suppressions (`lint`), expanding a `*` into its columns (`expand_star`), executing the
+//! statement (`execute_statement`), and invalidating the schema cache (`schema_cache`).
+
 use crate::workspace::StatementId;
+use pgls_analyse::{ActionCategory, Applicability};
 use pgls_configuration::RuleSelector;
 use pgls_fs::PgLSPath;
-use pgls_text_size::TextSize;
+use pgls_text_size::{TextRange, TextSize};
+
+pub(crate) mod execute_statement;
+pub(crate) mod expand_star;
+pub(crate) mod lint;
+pub(crate) mod schema_cache;
+
+pub use execute_statement::{
+    EXECUTE_STATEMENT_MAX_ROWS, ExecuteStatementError, ExecuteStatementParams,
+    ExecuteStatementResult,
+};
+pub use lint::{FixFileMode, FixFileParams, FixFileResult};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CodeActionsParams {
+    pub project_key: crate::workspace::ProjectKey,
     pub path: PgLSPath,
     pub cursor_position: TextSize,
     pub only: Vec<RuleSelector>,
@@ -36,7 +53,22 @@ pub enum CodeActionKind {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct EditAction {}
+pub struct EditAction {
+    /// The category of the diagnostic the action fixes or suppresses, e.g. `lint/banDropTable`.
+    /// `None` for refactors.
+    pub rule: Option<String>,
+    pub category: ActionCategory,
+    pub applicability: Applicability,
+    /// Non-overlapping edits of the file, ordered by their position.
+    pub edits: Vec<TextEdit>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TextEdit {
+    pub range: TextRange,
+    pub new_text: String,
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -49,17 +81,4 @@ pub struct CommandAction {
 pub enum CommandActionCategory {
     ExecuteStatement(StatementId),
     InvalidateSchemaCache,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct ExecuteStatementParams {
-    pub statement_id: StatementId,
-    pub path: PgLSPath,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct ExecuteStatementResult {
-    pub message: String,
 }

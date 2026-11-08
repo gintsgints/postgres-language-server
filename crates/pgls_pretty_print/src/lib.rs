@@ -1,6 +1,7 @@
 mod codegen;
 pub mod comments;
 pub mod emitter;
+mod identifiers;
 pub mod nodes;
 pub mod normalize;
 pub mod renderer;
@@ -41,7 +42,8 @@ pub enum ClauseBodyStyle {
     /// The body starts on the line after the keyword.
     #[default]
     Break,
-    /// The first element of the body stays on the keyword line: `FROM plan`.
+    /// The first element of the body stays on the keyword line: `FROM plan`. A select list of a
+    /// single item stays on the SELECT line: `SELECT 1`.
     Compact,
 }
 
@@ -117,6 +119,9 @@ pub struct FormatConfig {
     pub logical_operator_placement: LogicalOperatorPlacement,
     /// How a statement is laid out across lines. Default: Fit.
     pub layout: Layout,
+    /// How VALUES rows are laid out: fit within the line width or one row per line.
+    /// Default: Fit.
+    pub values_row_layout: Layout,
     /// How an explicit cast is spelled. Default: Cast.
     pub cast_style: CastStyle,
     /// Where the body of a clause starts. Default: Break.
@@ -140,6 +145,7 @@ impl Default for FormatConfig {
             comma_style: CommaStyle::default(),
             logical_operator_placement: LogicalOperatorPlacement::default(),
             layout: Layout::default(),
+            values_row_layout: Layout::default(),
             cast_style: CastStyle::default(),
             clause_body_style: ClauseBodyStyle::default(),
             isolate_semicolon: false,
@@ -160,6 +166,7 @@ impl From<FormatConfig> for RenderConfig {
             comma_style: _,
             logical_operator_placement: _,
             layout: _,
+            values_row_layout: _,
             cast_style: _,
             clause_body_style: _,
             isolate_semicolon,
@@ -213,10 +220,11 @@ pub fn format_statement(
     let attached = comments::attach_comments(sql, ast);
     let has_comments = !attached.leading_by_location.is_empty()
         || !attached.trailing_by_location.is_empty()
+        || !attached.before_case_end_by_location.is_empty()
         || !attached.unattached.is_empty();
 
     if !has_comments {
-        return format_statement_once(ast, config, attached);
+        return format_statement_once(ast, sql, config, attached);
     }
 
     let mut current_sql = sql.to_string();
@@ -225,7 +233,7 @@ pub fn format_statement(
     let mut seen_layouts = HashSet::from([current_sql.clone()]);
 
     for pass in 1..=MAX_COMMENT_FORMAT_PASSES {
-        let result = format_statement_once(&current_ast, config, attached)?;
+        let result = format_statement_once(&current_ast, &current_sql, config, attached)?;
         if result.formatted == current_sql {
             return Ok(result);
         }
@@ -254,6 +262,7 @@ pub fn format_statement(
 /// Formats a statement exactly once, including semantic verification.
 fn format_statement_once(
     ast: &NodeEnum,
+    sql: &str,
     config: &FormatConfig,
     attached: AttachedComments,
 ) -> Result<FormatResult, FormatError> {
@@ -270,7 +279,9 @@ fn format_statement_once(
         attached.leading_by_location,
         attached.trailing_by_location,
     );
-    nodes::emit_node_enum(ast, &mut emitter);
+    emitter.set_comments_before_case_end(attached.before_case_end_by_location);
+    emitter.set_truncated_identifiers(identifiers::truncated_identifiers(sql));
+    nodes::emit_statement(&mut emitter, ast);
     let pending = emitter.pending_comments();
     if pending > 0 {
         return Err(FormatError::UnplaceableComment { count: pending });
@@ -980,11 +991,11 @@ WHERE
             .formatted;
 
         assert!(
-            formatted.contains("\n    (\n      (accounts.person_id"),
+            formatted.contains("\n    (\n      (\n        accounts.person_id"),
             "{formatted}"
         );
         assert!(
-            formatted.contains("\n      (accounts.building_id"),
+            formatted.contains("\n      (\n        accounts.building_id"),
             "{formatted}"
         );
     }

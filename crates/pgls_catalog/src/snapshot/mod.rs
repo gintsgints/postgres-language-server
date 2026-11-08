@@ -158,34 +158,24 @@ impl Snapshot {
         })
     }
 
+    // The `find_*` lookups take names, not identifiers as written: convert SQL text with
+    // [`crate::identifier_name`] first.
+
     pub fn find_schema(&self, name: &str) -> Option<&Schema> {
-        let sanitized_name = Self::sanitize_identifier(name);
-        self.schemas.iter().find(|s| s.name == sanitized_name)
+        self.schemas.iter().find(|s| s.name == name)
     }
 
     pub fn find_tables(&self, name: &str, schema: Option<&str>) -> Vec<&Table> {
-        let sanitized_name = Self::sanitize_identifier(name);
         self.tables
             .iter()
-            .filter(|t| {
-                t.name == sanitized_name
-                    && schema
-                        .map(Self::sanitize_identifier)
-                        .as_deref()
-                        .is_none_or(|s| s == t.schema.as_str())
-            })
+            .filter(|t| t.name == name && schema.is_none_or(|s| s == t.schema))
             .collect()
     }
 
     pub fn find_type(&self, name: &str, schema: Option<&str>) -> Option<&PostgresType> {
-        let sanitized_name = Self::sanitize_identifier(name);
-        self.types.iter().find(|t| {
-            t.name == sanitized_name
-                && schema
-                    .map(Self::sanitize_identifier)
-                    .as_deref()
-                    .is_none_or(|s| s == t.schema.as_str())
-        })
+        self.types
+            .iter()
+            .find(|t| t.name == name && schema.is_none_or(|s| s == t.schema))
     }
 
     pub fn find_type_by_id(&self, id: i64) -> Option<&PostgresType> {
@@ -213,61 +203,25 @@ impl Snapshot {
     }
 
     pub fn find_cols(&self, name: &str, table: Option<&str>, schema: Option<&str>) -> Vec<&Column> {
-        let sanitized_name = Self::sanitize_identifier(name);
         self.columns
             .iter()
             .filter(|c| {
-                c.name.as_str() == sanitized_name
-                    && table
-                        .map(Self::sanitize_identifier)
-                        .as_deref()
-                        .is_none_or(|t| t == c.table_name.as_str())
-                    && schema
-                        .map(Self::sanitize_identifier)
-                        .as_deref()
-                        .is_none_or(|s| s == c.schema_name.as_str())
-            })
-            .collect()
-    }
-
-    pub fn find_types(&self, name: &str, schema: Option<&str>) -> Vec<&PostgresType> {
-        let sanitized_name = Self::sanitize_identifier(name);
-        self.types
-            .iter()
-            .filter(|t| {
-                t.name == sanitized_name
-                    && schema
-                        .map(Self::sanitize_identifier)
-                        .as_deref()
-                        .is_none_or(|s| s == t.schema.as_str())
+                c.name.as_str() == name
+                    && table.is_none_or(|t| t == c.table_name)
+                    && schema.is_none_or(|s| s == c.schema_name)
             })
             .collect()
     }
 
     pub fn find_functions(&self, name: &str, schema: Option<&str>) -> Vec<&Function> {
-        let sanitized_name = Self::sanitize_identifier(name);
         self.functions
             .iter()
-            .filter(|f| {
-                f.name == sanitized_name
-                    && schema
-                        .map(Self::sanitize_identifier)
-                        .as_deref()
-                        .is_none_or(|s| s == f.schema.as_str())
-            })
+            .filter(|f| f.name == name && schema.is_none_or(|s| s == f.schema))
             .collect()
     }
 
     pub fn find_roles(&self, name: &str) -> Vec<&Role> {
-        let sanitized_name = Self::sanitize_identifier(name);
-        self.roles
-            .iter()
-            .filter(|r| r.name == sanitized_name)
-            .collect()
-    }
-
-    fn sanitize_identifier(identifier: &str) -> String {
-        identifier.replace('"', "")
+        self.roles.iter().filter(|r| r.name == name).collect()
     }
 }
 
@@ -410,5 +364,42 @@ mod tests {
             .collect();
 
         assert_eq!(set.len(), cache.columns.len());
+    }
+
+    #[sqlx::test(migrator = "pgls_test_utils::MIGRATIONS")]
+    async fn it_skips_orphaned_catalog_objects(test_db: PgPool) {
+        // objects whose namespace no longer exists must be skipped instead of failing the
+        // whole snapshot. deleting the `pg_namespace` row directly leaves them orphaned.
+        let setup = r#"
+        CREATE SCHEMA orphaned;
+        CREATE TYPE orphaned.mood AS ENUM ('happy', 'sad');
+        CREATE FUNCTION orphaned.trigger_fn() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+        CREATE TABLE orphaned.items (id int);
+        CREATE TRIGGER items_trigger BEFORE INSERT ON orphaned.items
+            FOR EACH ROW EXECUTE FUNCTION orphaned.trigger_fn();
+        CREATE POLICY items_policy ON orphaned.items USING (true);
+
+        CREATE TABLE public.users (id int);
+        CREATE FUNCTION public.healthy() RETURNS int LANGUAGE sql AS 'SELECT 1';
+        CREATE TRIGGER users_trigger BEFORE INSERT ON public.users
+            FOR EACH ROW EXECUTE FUNCTION orphaned.trigger_fn();
+
+        DELETE FROM pg_catalog.pg_namespace WHERE nspname = 'orphaned';
+        "#;
+
+        test_db.execute(setup).await.unwrap();
+
+        let snapshot = Snapshot::load(&test_db)
+            .await
+            .expect("Failed to load snapshot");
+
+        assert!(snapshot.tables.iter().any(|t| t.name == "users"));
+        assert!(snapshot.functions.iter().any(|f| f.name == "healthy"));
+
+        assert!(!snapshot.functions.iter().any(|f| f.name == "trigger_fn"));
+        assert!(!snapshot.types.iter().any(|t| t.name == "mood"));
+        assert!(!snapshot.tables.iter().any(|t| t.name == "items"));
+        assert!(snapshot.triggers.is_empty());
+        assert!(snapshot.policies.is_empty());
     }
 }

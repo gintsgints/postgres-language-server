@@ -4,7 +4,7 @@ use crate::{
 };
 use pgls_query::{
     Node, NodeEnum,
-    protobuf::{AExprKind, TypeCast},
+    protobuf::{AExprKind, TypeCast, a_const::Val},
 };
 
 pub(super) fn emit_type_cast(e: &mut EventEmitter, n: &TypeCast) {
@@ -18,9 +18,22 @@ pub(super) fn emit_type_cast(e: &mut EventEmitter, n: &TypeCast) {
     e.group_end();
 }
 
+/// Emits `CAST(expr AS type)` whatever the configured cast style.
+///
+/// A cast in a `FROM` clause is a table function, and only the `CAST(...)` spelling is accepted
+/// there: `FROM (1 + 2)::int` is a syntax error.
+pub(super) fn emit_type_cast_call(e: &mut EventEmitter, n: &TypeCast) {
+    e.group_start(GroupKind::TypeCast);
+    emit_cast_call(e, n);
+    e.group_end();
+}
+
+/// Laid out like a function call: on one line when it fits, otherwise `expr as type` on its own
+/// line one level in, broken before `as` only when it doesn't fit there either.
 fn emit_cast_call(e: &mut EventEmitter, n: &TypeCast) {
     e.token(TokenKind::CAST_KW);
-    e.token(TokenKind::L_PAREN);
+    super::open_call_arguments(e);
+    e.group_start(GroupKind::List);
 
     if let Some(ref arg) = n.arg {
         super::emit_node(arg, e);
@@ -34,7 +47,8 @@ fn emit_cast_call(e: &mut EventEmitter, n: &TypeCast) {
         super::emit_type_name(e, type_name);
     }
 
-    e.token(TokenKind::R_PAREN);
+    e.group_end();
+    super::close_call_arguments(e);
 }
 
 fn emit_operator_cast(e: &mut EventEmitter, n: &TypeCast) {
@@ -57,16 +71,22 @@ fn emit_operator_cast(e: &mut EventEmitter, n: &TypeCast) {
     }
 }
 
-/// Whitelist of self contained expressions that can carry a `::` without parentheses.
+/// Whitelist of self contained expressions that can carry a `::`, or be the operand of other
+/// high-precedence syntax such as `AT TIME ZONE`, without parentheses.
 ///
 /// Anything absent from this list is parenthesised, which is always valid SQL. Listing the unsafe
 /// kinds instead would fail open on any node nobody thought about.
-fn needs_parentheses(node: &Node) -> bool {
+pub(super) fn needs_parentheses(node: &Node) -> bool {
     match node.node.as_ref() {
         Some(NodeEnum::AExpr(a_expr)) => a_expr.kind != AExprKind::AexprNullif as i32,
+        // A negative constant is emitted with its sign, and `-1::int` casts 1 before negating it.
+        Some(NodeEnum::AConst(a_const)) => match a_const.val.as_ref() {
+            Some(Val::Ival(i)) => i.ival < 0,
+            Some(Val::Fval(f)) => f.fval.starts_with('-'),
+            _ => false,
+        },
         Some(
-            NodeEnum::AConst(_)
-            | NodeEnum::ColumnRef(_)
+            NodeEnum::ColumnRef(_)
             | NodeEnum::ParamRef(_)
             | NodeEnum::FuncCall(_)
             | NodeEnum::NullIfExpr(_)

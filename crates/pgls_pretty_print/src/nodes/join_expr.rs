@@ -3,8 +3,8 @@ use pgls_query::protobuf::{JoinExpr, JoinType};
 use crate::TokenKind;
 use crate::emitter::{EventEmitter, GroupKind, LineType};
 
-use super::node_list::emit_comma_separated_list;
-use super::string::emit_identifier;
+use super::node_list::emit_parenthesized_list;
+use super::string::emit_identifier_maybe_quoted;
 
 pub(super) fn emit_join_expr(e: &mut EventEmitter, n: &JoinExpr) {
     e.group_start(GroupKind::JoinExpr);
@@ -78,6 +78,10 @@ pub(super) fn emit_join_expr(e: &mut EventEmitter, n: &JoinExpr) {
         JoinType::JoinAnti => {
             emit_join_token(TokenKind::IDENT("anti".to_string()), e);
         }
+        JoinType::JoinRightSemi => {
+            emit_join_token(TokenKind::RIGHT_KW, e);
+            emit_join_token(TokenKind::IDENT("semi".to_string()), e);
+        }
         JoinType::JoinRightAnti => {
             emit_join_token(TokenKind::RIGHT_KW, e);
             emit_join_token(TokenKind::IDENT("anti".to_string()), e);
@@ -102,29 +106,14 @@ pub(super) fn emit_join_expr(e: &mut EventEmitter, n: &JoinExpr) {
         e.line(LineType::SoftOrSpace);
         e.token(TokenKind::USING_KW);
         e.space();
-        e.token(TokenKind::L_PAREN);
-        if n.using_clause.len() > 1 {
-            e.indent_start();
-            e.line(LineType::SoftOrSpace);
-            emit_comma_separated_list(e, &n.using_clause, |node, e| {
-                // For USING clause, String nodes should be identifiers
-                if let Some(pgls_query::NodeEnum::String(s)) = node.node.as_ref() {
-                    emit_identifier(e, &s.sval);
-                } else {
-                    super::emit_node(node, e);
-                }
-            });
-            e.indent_end();
-        } else {
-            emit_comma_separated_list(e, &n.using_clause, |node, e| {
-                if let Some(pgls_query::NodeEnum::String(s)) = node.node.as_ref() {
-                    emit_identifier(e, &s.sval);
-                } else {
-                    super::emit_node(node, e);
-                }
-            });
-        }
-        e.token(TokenKind::R_PAREN);
+        emit_parenthesized_list(e, &n.using_clause, |node, e| {
+            // For USING clause, String nodes should be identifiers
+            if let Some(pgls_query::NodeEnum::String(s)) = node.node.as_ref() {
+                emit_identifier_maybe_quoted(e, &s.sval);
+            } else {
+                super::emit_node(node, e);
+            }
+        });
 
         // Emit USING alias if present (PostgreSQL 14+)
         // Format: USING (col1, col2) AS alias
@@ -132,15 +121,13 @@ pub(super) fn emit_join_expr(e: &mut EventEmitter, n: &JoinExpr) {
             e.space();
             e.token(TokenKind::AS_KW);
             e.space();
-            emit_identifier(e, &using_alias.aliasname);
+            emit_identifier_maybe_quoted(e, &using_alias.aliasname);
         }
     } else if let Some(ref quals) = n.quals {
         e.line(LineType::SoftOrSpace);
         e.token(TokenKind::ON_KW);
         e.space();
-        e.indent_start();
-        super::emit_node(quals, e);
-        e.indent_end();
+        super::emit_condition_on_keyword_line(e, quals);
     } else if matches!(jointype, JoinType::JoinInner) && !n.is_natural {
         // For INNER JOIN without qualifications (converted from CROSS JOIN), add ON TRUE
         // This is semantically equivalent to CROSS JOIN
@@ -157,20 +144,18 @@ pub(super) fn emit_join_expr(e: &mut EventEmitter, n: &JoinExpr) {
         e.space();
         e.token(TokenKind::AS_KW);
         e.space();
-        emit_identifier(e, &alias.aliasname);
+        emit_identifier_maybe_quoted(e, &alias.aliasname);
 
         // Emit column aliases if present
         if !alias.colnames.is_empty() {
             e.space();
-            e.token(TokenKind::L_PAREN);
-            emit_comma_separated_list(e, &alias.colnames, |node, emitter| {
+            emit_parenthesized_list(e, &alias.colnames, |node, emitter| {
                 if let Some(pgls_query::NodeEnum::String(s)) = node.node.as_ref() {
-                    emit_identifier(emitter, &s.sval);
+                    emit_identifier_maybe_quoted(emitter, &s.sval);
                 } else {
                     super::emit_node(node, emitter);
                 }
             });
-            e.token(TokenKind::R_PAREN);
         }
     }
 

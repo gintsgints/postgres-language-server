@@ -17,7 +17,7 @@ pub(super) fn emit_create_event_trig_stmt(e: &mut EventEmitter, n: &CreateEventT
     // Trigger name
     if !n.trigname.is_empty() {
         e.space();
-        super::emit_identifier(e, &n.trigname);
+        super::emit_identifier_maybe_quoted(e, &n.trigname);
     }
 
     // ON event_name
@@ -42,27 +42,28 @@ pub(super) fn emit_create_event_trig_stmt(e: &mut EventEmitter, n: &CreateEventT
             }
             // Each when clause is a DefElem with defname=tag and arg=List of values
             if let Some(pgls_query::NodeEnum::DefElem(def_elem)) = when.node.as_ref() {
-                // Emit TAG name (uppercased)
-                e.token(TokenKind::IDENT(def_elem.defname.to_uppercase()));
+                // Emit TAG name
+                super::emit_keyword(e, &def_elem.defname);
                 e.space();
                 e.token(TokenKind::IN_KW);
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                // Emit list of values
+                // Emit list of values, filling indented lines when they don't fit
                 if let Some(arg) = &def_elem.arg
                     && let Some(pgls_query::NodeEnum::List(list)) = arg.node.as_ref()
                 {
-                    for (j, item) in list.items.iter().enumerate() {
-                        if j > 0 {
-                            e.token(TokenKind::COMMA);
-                            e.space();
-                        }
+                    e.group_start(GroupKind::List);
+                    super::open_call_arguments(e);
+                    super::node_list::emit_fill_comma_separated_list(e, &list.items, |item, e| {
                         if let Some(pgls_query::NodeEnum::String(s)) = item.node.as_ref() {
                             super::emit_string_literal(e, s);
                         }
-                    }
+                    });
+                    super::close_call_arguments(e);
+                    e.group_end();
+                } else {
+                    e.token(TokenKind::L_PAREN);
+                    e.token(TokenKind::R_PAREN);
                 }
-                e.token(TokenKind::R_PAREN);
             }
         }
     }
@@ -79,6 +80,5 @@ pub(super) fn emit_create_event_trig_stmt(e: &mut EventEmitter, n: &CreateEventT
         e.token(TokenKind::R_PAREN);
     }
 
-    e.token(TokenKind::SEMICOLON);
     e.group_end();
 }

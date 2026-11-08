@@ -9,8 +9,7 @@ select
  t.tgtype as "details_bitmask!"
 from
  pg_catalog.pg_trigger t
--- inner joins: a trigger whose function, table or namespace is missing is an
--- orphaned catalog row. skip it instead of failing the entire snapshot load.
+-- inner joins skip orphaned triggers whose function, table or namespaces are gone
 join pg_catalog.pg_proc p on t.tgfoid = p.oid
 join pg_catalog.pg_class c on t.tgrelid = c.oid
 join pg_catalog.pg_namespace table_ns on c.relnamespace = table_ns.oid

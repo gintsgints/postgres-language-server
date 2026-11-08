@@ -20,21 +20,23 @@ pub struct ScopeTracker {
 
 impl ScopeTracker {
     pub fn new() -> Self {
-        Self { scopes: vec![] }
+        // The `program` root node is never registered, so its scope exists from the start.
+        // Children of `program` that aren't scope boundaries, such as a stray `;`, belong to it.
+        Self {
+            scopes: vec![Scope {
+                ancestors: AncestorTracker::new(),
+            }],
+        }
     }
 
     pub fn register<'a>(&mut self, node: tree_sitter::Node<'a>, position: usize) {
-        // The `program` root node is never registered directly, so the first node
-        // we see is one of its children. Usually that's a scope boundary (a
-        // statement, block, ...), but it can also be a stray token such as a
-        // trailing `;` – in which case we still need a base scope for it.
-        if SCOPE_BOUNDARIES.contains(&node.kind()) || self.scopes.is_empty() {
+        if SCOPE_BOUNDARIES.contains(&node.kind()) {
             self.add_new_scope(node);
         }
 
         self.scopes
             .last_mut()
-            .expect("a scope was just ensured to exist")
+            .expect("the root scope always exists")
             .ancestors
             .register(node, position);
     }
@@ -46,7 +48,7 @@ impl ScopeTracker {
     }
 
     pub fn current(&self) -> &Scope {
-        self.scopes.last().unwrap()
+        self.scopes.last().expect("the root scope always exists")
     }
 }
 
@@ -138,6 +140,7 @@ mod tests {
                 position: (pos as u32).into(),
                 text: sql,
                 tree: &tree,
+                server_version_num: None,
             };
             let _ = TreesitterContext::new(params);
         }
@@ -167,6 +170,14 @@ mod tests {
     #[test]
     fn scope_boundary_comment() {
         assert_no_panic_for_all_positions("-- a comment\nSELECT 1;");
+    }
+
+    #[test]
+    fn issue_769_regression() {
+        assert_no_panic_for_all_positions("BEGIN END; ");
+        assert_no_panic_for_all_positions(
+            "create procedure p() language plpgsql as $$ begin null; end; $$; ",
+        );
     }
 
     #[test]

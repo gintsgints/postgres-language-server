@@ -1,4 +1,4 @@
-use pgls_analyse::RuleMeta;
+use pgls_analyse::{Applicability, RuleMeta};
 use pgls_console::fmt::Display;
 use pgls_console::{MarkupBuf, markup};
 use pgls_diagnostics::advice::CodeSuggestionAdvice;
@@ -6,9 +6,11 @@ use pgls_diagnostics::{
     Advices, Category, Diagnostic, DiagnosticTags, Location, LogCategory, MessageAndDescription,
     Visit,
 };
-use pgls_text_size::TextRange;
+use pgls_text_size::{TextRange, TextSize};
 use std::fmt::Debug;
+use std::ops::Range;
 
+use crate::AnalysableStatement;
 use crate::linter_context::LinterRuleContext;
 
 /// Trait implemented by all AST-based linter rules
@@ -16,7 +18,6 @@ pub trait LinterRule: RuleMeta + Sized {
     type Options: Default + Clone + Debug;
 
     /// Execute the rule on the given AST context
-    /// `snapshot` will only be available if the user has a working database connection.
     fn run(rule_context: &LinterRuleContext<Self>) -> Vec<LinterDiagnostic>;
 }
 
@@ -34,6 +35,109 @@ pub struct LinterDiagnostic {
     pub(crate) tags: DiagnosticTags,
     #[advice]
     pub(crate) rule_advice: RuleAdvice,
+    pub(crate) fix: Option<RuleFix>,
+}
+
+/// A change to the source that fixes the issue reported by a diagnostic.
+///
+/// The ranges of the edits are relative to the statement while the rule runs, and relative to
+/// the file in the diagnostics returned by the analyser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleFix {
+    /// What the fix does, e.g. "Add CONCURRENTLY".
+    pub message: String,
+    /// Set by the analyser from the fix kind of the rule, unless the rule marked the fix as
+    /// unsafe.
+    pub applicability: Applicability,
+    /// Non-overlapping edits, ordered by their position.
+    pub edits: Vec<FixEdit>,
+}
+
+/// Replaces the text in `range` with `replacement`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixEdit {
+    pub range: TextRange,
+    pub replacement: String,
+}
+
+impl RuleFix {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            applicability: Applicability::Always,
+            edits: Vec::new(),
+        }
+    }
+
+    /// Marks the fix as unsafe, even if the rule's fixes are safe in general.
+    pub fn unsafe_fix(mut self) -> Self {
+        self.applicability = Applicability::MaybeIncorrect;
+        self
+    }
+
+    /// Inserts `text` at `offset`.
+    pub fn insert(self, offset: TextSize, text: impl Into<String>) -> Self {
+        self.replace(TextRange::empty(offset), text)
+    }
+
+    /// Replaces the text in `range` with `text`.
+    pub fn replace(mut self, range: TextRange, text: impl Into<String>) -> Self {
+        self.edits.push(FixEdit {
+            range,
+            replacement: text.into(),
+        });
+        self
+    }
+
+    /// Removes the text in `range`.
+    pub fn delete(self, range: TextRange) -> Self {
+        self.replace(range, "")
+    }
+
+    /// Applies the fix to `text`. The edits must be relative to `text`.
+    pub fn apply(&self, text: &str) -> String {
+        debug_assert!(
+            self.edits_fit(text),
+            "the edits of fix {:?} are not sorted, overlap, or are not on char boundaries of a text of length {}: {:?}",
+            self.message,
+            text.len(),
+            self.edits
+        );
+        let mut result = String::with_capacity(text.len());
+        let mut last = 0;
+        for edit in &self.edits {
+            let start = usize::from(edit.range.start());
+            result.push_str(&text[last..start]);
+            result.push_str(&edit.replacement);
+            last = usize::from(edit.range.end());
+        }
+        result.push_str(&text[last..]);
+        result
+    }
+
+    /// The range covered by all edits.
+    pub fn range(&self) -> Option<TextRange> {
+        let first = self.edits.first()?;
+        let last = self.edits.last()?;
+        Some(first.range.cover(last.range))
+    }
+
+    /// Whether the edits are sorted, don't overlap, and lie on char boundaries of `text`.
+    fn edits_fit(&self, text: &str) -> bool {
+        let mut previous_end = TextSize::from(0);
+        self.edits.iter().all(|edit| {
+            let fits = edit.range.start() >= previous_end
+                && text.get(Range::<usize>::from(edit.range)).is_some();
+            previous_end = edit.range.end();
+            fits
+        })
+    }
+
+    pub(crate) fn shift(&mut self, offset: TextSize) {
+        for edit in &mut self.edits {
+            edit.range += offset;
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -105,7 +209,25 @@ impl LinterDiagnostic {
             message: MessageAndDescription::from(message),
             tags: DiagnosticTags::empty(),
             rule_advice: RuleAdvice::default(),
+            fix: None,
         }
+    }
+
+    /// Attaches a fix to this [`LinterDiagnostic`]. The rule must declare a `fix_kind`.
+    pub fn fix(mut self, fix: RuleFix) -> Self {
+        self.fix = Some(fix);
+        self
+    }
+
+    /// Attaches a fix if there is one.
+    pub fn maybe_fix(mut self, fix: Option<RuleFix>) -> Self {
+        self.fix = fix;
+        self
+    }
+
+    /// The fix for the reported issue, if the rule can fix it.
+    pub fn get_fix(&self) -> Option<&RuleFix> {
+        self.fix.as_ref()
     }
 
     /// Set an explicit plain-text summary for this diagnostic.
@@ -121,6 +243,20 @@ impl LinterDiagnostic {
     pub fn deprecated(mut self) -> Self {
         self.tags |= DiagnosticTags::DEPRECATED_CODE;
         self
+    }
+
+    /// Moves the spans of the diagnostic, which are relative to the statement while the rule
+    /// runs, into the file. A diagnostic without a span points at the whole statement.
+    pub(crate) fn move_into_file(&mut self, statement: &AnalysableStatement) {
+        self.span = Some(match self.span {
+            Some(span) => statement.document_range(span),
+            None => statement.range,
+        });
+        for detail in &mut self.rule_advice.details {
+            if let Some(range) = &mut detail.range {
+                *range = statement.document_range(*range);
+            }
+        }
     }
 
     /// Sets the span of this diagnostic.
@@ -140,7 +276,7 @@ impl LinterDiagnostic {
 
     /// Attaches a label to this [`LinterDiagnostic`].
     ///
-    /// The given span has to be in the file that was provided while creating this [`LinterDiagnostic`].
+    /// Like the span of the diagnostic, the given span is relative to the statement.
     pub fn label(mut self, span: Option<TextRange>, msg: impl Display) -> Self {
         self.rule_advice.details.push(Detail {
             log_category: LogCategory::Info,

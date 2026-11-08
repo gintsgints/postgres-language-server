@@ -1,4 +1,4 @@
-use pgls_analyse::{AnalysisFilter, AppliesTo, GroupCategory, RuleGroup, RuleKey};
+use pgls_analyse::{AnalysisFilter, Applicability, AppliesTo, GroupCategory, RuleGroup, RuleKey};
 
 use crate::linter_context::{AnalysedFileContext, LinterRuleContext, StatementContext};
 use crate::linter_options::LinterOptions;
@@ -74,7 +74,6 @@ pub struct LinterRegistryRuleParams<'a> {
     pub options: &'a LinterOptions,
     pub analysed_file_context: &'a AnalysedFileContext<'a>,
     pub statement: &'a StatementContext<'a>,
-    pub snapshot: Option<&'a pgls_catalog::Snapshot>,
 }
 
 /// Executor for rule as a generic function pointer
@@ -95,12 +94,24 @@ impl RegistryLinterRule {
             let ctx = LinterRuleContext::new(
                 params.root,
                 &options,
-                params.snapshot,
                 params.analysed_file_context,
                 params.statement,
             );
 
-            R::run(&ctx)
+            let mut diagnostics = R::run(&ctx);
+            for fix in diagnostics.iter_mut().filter_map(|d| d.fix.as_mut()) {
+                debug_assert!(
+                    R::METADATA.fix_kind.applicability().is_some(),
+                    "rule {} reports fixes but doesn't declare a fix_kind",
+                    R::METADATA.name
+                );
+                if let Some(applicability) = R::METADATA.fix_kind.applicability()
+                    && fix.applicability == Applicability::Always
+                {
+                    fix.applicability = applicability;
+                }
+            }
+            diagnostics
         }
 
         Self {

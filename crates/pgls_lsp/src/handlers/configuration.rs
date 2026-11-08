@@ -1,8 +1,8 @@
-use crate::session::Session;
+use crate::session::SessionHandle;
 use pgls_configuration::PartialConfiguration;
 use serde::Deserialize;
-use tower_lsp::jsonrpc::{Error, Result as LspResult};
-use tower_lsp::lsp_types::DidChangeConfigurationParams;
+use tower_lsp_server::jsonrpc::{Error, Result as LspResult};
+use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
 /// Deliberately not `Debug`: the payload carries whatever the client overrides, including database
 /// credentials, and `PartialDatabaseConfiguration` renders its password verbatim.
@@ -19,13 +19,13 @@ pub(crate) struct SetConfigurationOverridesParams {
 /// This is a request rather than a notification so the client receives an
 /// acknowledgement and can distinguish applied from failed configuration.
 pub(crate) async fn set_configuration_overrides(
-    session: &Session,
+    session: &SessionHandle,
     params: SetConfigurationOverridesParams,
 ) -> LspResult<()> {
     let status = session.set_client_overrides(params.overrides).await;
     if status.is_error() {
         return Err(Error {
-            code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+            code: tower_lsp_server::jsonrpc::ErrorCode::InternalError,
             message: "Configuration overrides could not be applied; check the server log".into(),
             data: None,
         });
@@ -36,7 +36,7 @@ pub(crate) async fn set_configuration_overrides(
 /// The configuration notification writes a sticky layer so the snapshot
 /// survives later reloads, unlike the former one-shot merge.
 pub(crate) async fn did_change_configuration(
-    session: &Session,
+    session: &SessionHandle,
     params: DidChangeConfigurationParams,
 ) {
     match serde_json::from_value::<PartialConfiguration>(params.settings) {

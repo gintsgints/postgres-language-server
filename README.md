@@ -20,7 +20,7 @@ This project provides a toolchain for Postgres development, built on Postgres' o
 
 The following features are available today:
 
-- [Autocompletion & Hover](https://pg-language-server.com/latest/features/editor_features/)
+- [Autocompletion, Hover, Inlay Hints & Semantic Highlighting](https://pg-language-server.com/latest/features/editor_features/)
 - [Syntax Diagnostics](https://pg-language-server.com/latest/features/syntax_diagnostics/)
 - [Type Checking](https://pg-language-server.com/latest/features/type_checking/)
 - [Formatting](https://pg-language-server.com/latest/features/formatting/)
@@ -34,6 +34,8 @@ The following features are available today:
 nix develop     # or skip if not using Nix
 docker-compose up -d
 ```
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and [ARCHITECTURE.md](./ARCHITECTURE.md) for an overview of the code base.
 
 ## Acknowledgements
 

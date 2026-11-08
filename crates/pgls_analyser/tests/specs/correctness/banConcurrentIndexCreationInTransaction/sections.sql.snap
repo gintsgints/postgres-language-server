@@ -1,0 +1,22 @@
+---
+source: crates/pgls_analyser/tests/rules_tests.rs
+expression: snapshot
+---
+# Input
+```
+-- The up section runs without a transaction, the down section in one.
+-- section: up transaction:false
+CREATE INDEX CONCURRENTLY users_email_idx ON users (email);
+
+-- section: down
+-- expect_lint/banConcurrentIndexCreationInTransaction
+DROP INDEX CONCURRENTLY users_email_idx;
+
+```
+
+# Diagnostics
+lint/banConcurrentIndexCreationInTransaction ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × DROP INDEX CONCURRENTLY cannot be used inside a transaction block.
+  
+  i Run DROP INDEX CONCURRENTLY outside of a transaction. Migration tools usually run in transactions, so you may need to run this statement in its own migration or manually.

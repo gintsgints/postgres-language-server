@@ -15,9 +15,9 @@ select * from persons;
 create function get_all_persons()
 returns setof person_type
 language sql
-as $function$
-SELECT * FROM persons;
-$function$;
+as $$
+    SELECT * FROM persons;
+$$;
 
 select * from get_all_persons();
 
@@ -37,7 +37,7 @@ create table stuff (id int);
 alter table persons
   inherit stuff;
 
-create table personsx of person_type (myname with options not null );
+create table personsx of person_type (myname with options not null);
 
 create table persons2 of person_type
 (
@@ -84,9 +84,7 @@ insert into persons values (1, 'test');
 create function namelen(person_type)
 returns int
 language sql
-as $function$
-SELECT length($1.name)
-$function$;
+as $$ SELECT length($1.name) $$;
 
 select id, namelen(persons) from persons;
 

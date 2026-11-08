@@ -1,33 +1,76 @@
 use pgls_query::{
-    NodeEnum,
+    Node, NodeEnum,
     protobuf::{ConstrType, Constraint},
 };
 
-use crate::TokenKind;
 use crate::emitter::{EventEmitter, GroupKind, LineType};
+use crate::{Layout, TokenKind};
 
-use super::node_list::emit_comma_separated_list;
-use super::string::emit_identifier;
+use super::node_list::emit_parenthesized_list;
+use super::string::emit_identifier_maybe_quoted;
 
 pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
+    emit_constraint_of(e, n, Owner::Table);
+}
+
+/// A constraint of `ALTER DOMAIN ... ADD`.
+pub(super) fn emit_domain_constraint(e: &mut EventEmitter, n: &Constraint) {
+    emit_constraint_of(e, n, Owner::Domain);
+}
+
+/// What a constraint belongs to. The parse tree can't tell a domain's `NOT NULL` from a table's
+/// `NOT NULL value`: both have the keys `value`, so the statement around it decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// A table or column constraint, and the constraints of `CREATE DOMAIN`, which the parser
+    /// builds like column constraints.
+    Table,
+    /// `ALTER DOMAIN ... ADD`, the only place that builds a domain constraint.
+    Domain,
+}
+
+fn emit_constraint_of(e: &mut EventEmitter, n: &Constraint, owner: Owner) {
     e.group_start(GroupKind::Constraint);
+    // A broken constraint continues one level deeper than where it starts. The indent starts at
+    // the first continuation line, so a column list on the first line breaks relative to it.
+    let mut continued = false;
 
     match n.contype {
         x if x == ConstrType::ConstrNull as i32 => {
             e.token(TokenKind::NULL_KW);
         }
         x if x == ConstrType::ConstrNotnull as i32 => {
-            // For domain constraints: CONSTRAINT name NOT NULL
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
             e.token(TokenKind::NOT_KW);
             e.space();
             e.token(TokenKind::NULL_KW);
-            // Note: keys field may contain 'value' for domains, but it's not emitted
+            // A table constraint names its column (since Postgres 18). The parser sets the keys of
+            // a domain constraint to `value`, which is not written (`DomainConstraintElem`,
+            // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/gram.y#L4446).
+            if owner == Owner::Table
+                && let [key] = n.keys.as_slice()
+                && let Some(NodeEnum::String(column)) = &key.node
+            {
+                e.space();
+                emit_identifier_maybe_quoted(e, &column.sval);
+            }
+            if n.is_no_inherit {
+                e.space();
+                e.token(TokenKind::NO_KW);
+                e.space();
+                e.token(TokenKind::INHERIT_KW);
+            }
+            if !n.initially_valid {
+                e.space();
+                e.token(TokenKind::NOT_KW);
+                e.space();
+                e.token(TokenKind::VALID_KW);
+            }
         }
         x if x == ConstrType::ConstrDefault as i32 => {
             e.token(TokenKind::DEFAULT_KW);
@@ -56,7 +99,7 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
 
@@ -79,14 +122,14 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 }
             }
 
-            e.line(LineType::SoftOrSpace);
+            continue_line(e, &mut continued);
             e.token(TokenKind::AS_KW);
             e.space();
             e.token(TokenKind::IDENTITY_KW);
 
             // Add sequence options if present (e.g., START 7 INCREMENT 5)
             if !n.options.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::L_PAREN);
                 for (idx, opt) in n.options.iter().enumerate() {
                     if idx > 0 {
@@ -101,7 +144,7 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             }
         }
         x if x == ConstrType::ConstrGenerated as i32 => {
-            // GENERATED ALWAYS AS (expr) STORED
+            // GENERATED ALWAYS AS (expr) {STORED | VIRTUAL}
             e.token(TokenKind::GENERATED_KW);
             e.space();
             e.token(TokenKind::ALWAYS_KW);
@@ -116,14 +159,19 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             }
 
             e.space();
-            e.token(TokenKind::STORED_KW);
+            // generated_kind is "s" (STORED) or "v" (VIRTUAL, since Postgres 18)
+            if n.generated_kind == "v" {
+                e.token(TokenKind::VIRTUAL_KW);
+            } else {
+                e.token(TokenKind::STORED_KW);
+            }
         }
         x if x == ConstrType::ConstrCheck as i32 => {
             // CONSTRAINT name CHECK (expr) [NO INHERIT]
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
 
@@ -131,9 +179,7 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
             if let Some(ref raw_expr) = n.raw_expr {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                super::emit_node(raw_expr, e);
-                e.token(TokenKind::R_PAREN);
+                emit_check_condition(e, raw_expr);
             }
 
             if n.is_no_inherit {
@@ -143,7 +189,11 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 e.token(TokenKind::INHERIT_KW);
             }
 
-            if !n.initially_valid {
+            // NOT ENFORCED implies NOT VALID
+            if !n.is_enforced {
+                e.space();
+                emit_not_enforced(e);
+            } else if !n.initially_valid {
                 e.space();
                 e.token(TokenKind::NOT_KW);
                 e.space();
@@ -155,7 +205,7 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
 
@@ -165,25 +215,21 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
             if !n.keys.is_empty() {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.keys, super::emit_node);
-                e.token(TokenKind::R_PAREN);
+                emit_keys(e, n);
             }
 
             // INCLUDE (columns)
             if !n.including.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::INCLUDE_KW);
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.including, |node, emitter| {
+                emit_parenthesized_list(e, &n.including, |node, emitter| {
                     if let Some(pgls_query::NodeEnum::String(s)) = &node.node {
-                        emit_identifier(emitter, &s.sval);
+                        emit_identifier_maybe_quoted(emitter, &s.sval);
                     } else {
                         super::emit_node(node, emitter);
                     }
                 });
-                e.token(TokenKind::R_PAREN);
             }
 
             if !n.indexname.is_empty() {
@@ -192,29 +238,29 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 e.space();
                 e.token(TokenKind::INDEX_KW);
                 e.space();
-                emit_identifier(e, &n.indexname);
+                emit_identifier_maybe_quoted(e, &n.indexname);
             }
 
             // USING INDEX TABLESPACE for PRIMARY KEY
             if !n.indexspace.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::USING_KW);
                 e.space();
                 e.token(TokenKind::INDEX_KW);
                 e.space();
                 e.token(TokenKind::TABLESPACE_KW);
                 e.space();
-                emit_identifier(e, &n.indexspace);
+                emit_identifier_maybe_quoted(e, &n.indexspace);
             }
 
-            emit_deferrable(e, n);
+            emit_deferrable(e, n, &mut continued);
         }
         x if x == ConstrType::ConstrUnique as i32 => {
             // CONSTRAINT name UNIQUE (columns)
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
 
@@ -234,25 +280,21 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
             if !n.keys.is_empty() {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.keys, super::emit_node);
-                e.token(TokenKind::R_PAREN);
+                emit_keys(e, n);
             }
 
             // INCLUDE (columns)
             if !n.including.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::INCLUDE_KW);
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.including, |node, emitter| {
+                emit_parenthesized_list(e, &n.including, |node, emitter| {
                     if let Some(pgls_query::NodeEnum::String(s)) = &node.node {
-                        emit_identifier(emitter, &s.sval);
+                        emit_identifier_maybe_quoted(emitter, &s.sval);
                     } else {
                         super::emit_node(node, emitter);
                     }
                 });
-                e.token(TokenKind::R_PAREN);
             }
 
             if !n.indexname.is_empty() {
@@ -261,29 +303,29 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 e.space();
                 e.token(TokenKind::INDEX_KW);
                 e.space();
-                emit_identifier(e, &n.indexname);
+                emit_identifier_maybe_quoted(e, &n.indexname);
             }
 
             // USING INDEX TABLESPACE for UNIQUE
             if !n.indexspace.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::USING_KW);
                 e.space();
                 e.token(TokenKind::INDEX_KW);
                 e.space();
                 e.token(TokenKind::TABLESPACE_KW);
                 e.space();
-                emit_identifier(e, &n.indexspace);
+                emit_identifier_maybe_quoted(e, &n.indexspace);
             }
 
-            emit_deferrable(e, n);
+            emit_deferrable(e, n, &mut continued);
         }
         x if x == ConstrType::ConstrExclusion as i32 => {
             // CONSTRAINT name EXCLUDE [USING method] (exclusion_list) [WHERE (predicate)]
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
+                emit_identifier_maybe_quoted(e, &n.conname);
                 e.space();
             }
 
@@ -298,78 +340,39 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
             if !n.exclusions.is_empty() {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-
-                for (idx, exclusion) in n.exclusions.iter().enumerate() {
-                    if idx > 0 {
-                        e.token(TokenKind::COMMA);
-                        e.line(crate::emitter::LineType::SoftOrSpace);
-                    }
-
-                    let exclusion_list = assert_node_variant!(List, exclusion);
-                    debug_assert!(exclusion_list.items.len() >= 2);
-
-                    if let Some(index_elem) = exclusion_list.items.first() {
-                        super::emit_node(index_elem, e);
-                    }
-
-                    if let Some(operators) = exclusion_list.items.get(1) {
-                        e.space();
-                        e.token(TokenKind::WITH_KW);
-                        e.space();
-
-                        match operators.node.as_ref() {
-                            Some(pgls_query::NodeEnum::List(op_list)) => {
-                                for (op_idx, op) in op_list.items.iter().enumerate() {
-                                    if op_idx > 0 {
-                                        e.token(TokenKind::COMMA);
-                                        e.space();
-                                    }
-                                    emit_exclusion_operator(e, op);
-                                }
-                            }
-                            _ => emit_exclusion_operator(e, operators),
-                        }
-                    }
-                }
-
-                e.token(TokenKind::R_PAREN);
+                emit_parenthesized_list(e, &n.exclusions, emit_exclusion);
             }
 
             // INCLUDE (columns)
             if !n.including.is_empty() {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::INCLUDE_KW);
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.including, |node, emitter| {
+                emit_parenthesized_list(e, &n.including, |node, emitter| {
                     if let Some(pgls_query::NodeEnum::String(s)) = &node.node {
-                        emit_identifier(emitter, &s.sval);
+                        emit_identifier_maybe_quoted(emitter, &s.sval);
                     } else {
                         super::emit_node(node, emitter);
                     }
                 });
-                e.token(TokenKind::R_PAREN);
             }
 
             if let Some(ref where_clause) = n.where_clause {
                 e.space();
                 e.token(TokenKind::WHERE_KW);
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                super::emit_clause_condition(e, where_clause);
-                e.token(TokenKind::R_PAREN);
+                super::emit_parenthesized_condition(e, GroupKind::Constraint, where_clause);
             }
 
-            emit_deferrable(e, n);
+            emit_deferrable(e, n, &mut continued);
         }
         x if x == ConstrType::ConstrForeign as i32 => {
             // CONSTRAINT name FOREIGN KEY (fk_attrs) REFERENCES pktable (pk_attrs) [actions]
             if !n.conname.is_empty() {
                 e.token(TokenKind::CONSTRAINT_KW);
                 e.space();
-                emit_identifier(e, &n.conname);
-                e.line(LineType::SoftOrSpace);
+                emit_identifier_maybe_quoted(e, &n.conname);
+                e.space();
             }
 
             // Table-level constraint has FOREIGN KEY (...)
@@ -378,11 +381,11 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 e.token(TokenKind::FOREIGN_KW);
                 e.space();
                 e.token(TokenKind::KEY_KW);
-                e.line(LineType::SoftOrSpace);
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, &n.fk_attrs, super::emit_node);
-                e.token(TokenKind::R_PAREN);
-                e.line(LineType::SoftOrSpace);
+                e.space();
+                emit_parenthesized_list(e, &n.fk_attrs, |node, e| {
+                    emit_period_column(e, node, &n.fk_attrs, n.fk_with_period);
+                });
+                continue_line(e, &mut continued);
             }
 
             e.token(TokenKind::REFERENCES_KW);
@@ -393,9 +396,9 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
                 if !n.pk_attrs.is_empty() {
                     e.space();
-                    e.token(TokenKind::L_PAREN);
-                    emit_comma_separated_list(e, &n.pk_attrs, super::emit_node);
-                    e.token(TokenKind::R_PAREN);
+                    emit_parenthesized_list(e, &n.pk_attrs, |node, e| {
+                        emit_period_column(e, node, &n.pk_attrs, n.pk_with_period);
+                    });
                 }
             }
 
@@ -403,13 +406,13 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             if !n.fk_matchtype.is_empty() {
                 match n.fk_matchtype.as_str() {
                     "f" => {
-                        e.line(LineType::SoftOrSpace);
+                        continue_line(e, &mut continued);
                         e.token(TokenKind::MATCH_KW);
                         e.space();
                         e.token(TokenKind::FULL_KW);
                     }
                     "p" => {
-                        e.line(LineType::SoftOrSpace);
+                        continue_line(e, &mut continued);
                         e.token(TokenKind::MATCH_KW);
                         e.space();
                         e.token(TokenKind::PARTIAL_KW);
@@ -423,19 +426,19 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
 
             // ON DELETE action - allow line break before
             if !n.fk_del_action.is_empty() && n.fk_del_action != "a" {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 emit_foreign_key_action(e, &n.fk_del_action, "DELETE", &n.fk_del_set_cols);
             }
 
             // ON UPDATE action - allow line break before
             if !n.fk_upd_action.is_empty() && n.fk_upd_action != "a" {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 emit_foreign_key_action(e, &n.fk_upd_action, "UPDATE", &[]);
             }
 
             // DEFERRABLE - allow line break before
             if n.deferrable {
-                e.line(LineType::SoftOrSpace);
+                continue_line(e, &mut continued);
                 e.token(TokenKind::DEFERRABLE_KW);
 
                 if n.initdeferred {
@@ -451,8 +454,12 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
                 }
             }
 
-            if !n.initially_valid {
-                e.line(LineType::SoftOrSpace);
+            // NOT ENFORCED implies NOT VALID
+            if !n.is_enforced {
+                continue_line(e, &mut continued);
+                emit_not_enforced(e);
+            } else if !n.initially_valid {
+                continue_line(e, &mut continued);
                 e.token(TokenKind::NOT_KW);
                 e.space();
                 e.token(TokenKind::VALID_KW);
@@ -480,6 +487,14 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
             e.space();
             e.token(TokenKind::IMMEDIATE_KW);
         }
+        x if x == ConstrType::ConstrAttrEnforced as i32 => {
+            // ENFORCED constraint attribute (since Postgres 18)
+            e.token(TokenKind::ENFORCED_KW);
+        }
+        x if x == ConstrType::ConstrAttrNotEnforced as i32 => {
+            // NOT ENFORCED constraint attribute (since Postgres 18)
+            emit_not_enforced(e);
+        }
         _ => {
             // Unknown constraint type - emit placeholder
             e.token(TokenKind::IDENT(format!(
@@ -489,13 +504,45 @@ pub(super) fn emit_constraint(e: &mut EventEmitter, n: &Constraint) {
         }
     }
 
+    if continued {
+        e.indent_end();
+    }
     e.group_end();
 }
 
+/// Emits the parenthesized condition of a CHECK constraint.
+///
+/// Expanded layout breaks between clauses, and a constraint is not one: its condition stays on one
+/// line when it fits. Once it breaks, expanded layout still puts each operand of its AND or OR chain
+/// on its own line, so the chain breaks with the parentheses rather than on its own.
+fn emit_check_condition(e: &mut EventEmitter, condition: &Node) {
+    let expanded = matches!(e.config().layout, Layout::Expanded);
+
+    e.with_layout(Layout::Fit, |e| {
+        super::emit_parenthesized_condition_with(e, GroupKind::Constraint, condition, |node, e| {
+            match node {
+                NodeEnum::BoolExpr(n) if expanded => {
+                    super::bool_expr::emit_bool_expr_in_enclosing_group(e, n);
+                }
+                _ => super::emit_node_enum(node, e),
+            }
+        });
+    });
+}
+
+/// Starts a continuation line of a constraint, which is indented once whatever their number.
+fn continue_line(e: &mut EventEmitter, continued: &mut bool) {
+    if !*continued {
+        e.indent_start();
+        *continued = true;
+    }
+    e.line(LineType::SoftOrSpace);
+}
+
 /// `INITIALLY DEFERRED` implies `DEFERRABLE` in the AST, so emitting both round-trips either spelling.
-fn emit_deferrable(e: &mut EventEmitter, n: &Constraint) {
+fn emit_deferrable(e: &mut EventEmitter, n: &Constraint, continued: &mut bool) {
     if n.deferrable {
-        e.space();
+        continue_line(e, continued);
         e.token(TokenKind::DEFERRABLE_KW);
 
         if n.initdeferred {
@@ -503,6 +550,65 @@ fn emit_deferrable(e: &mut EventEmitter, n: &Constraint) {
             e.token(TokenKind::INITIALLY_KW);
             e.space();
             e.token(TokenKind::DEFERRED_KW);
+        }
+    }
+}
+
+fn emit_not_enforced(e: &mut EventEmitter) {
+    e.token(TokenKind::NOT_KW);
+    e.space();
+    e.token(TokenKind::ENFORCED_KW);
+}
+
+/// Emits the columns of a primary key or unique constraint, the last one followed by
+/// `WITHOUT OVERLAPS` (since Postgres 18) if the constraint has it.
+fn emit_keys(e: &mut EventEmitter, n: &Constraint) {
+    emit_parenthesized_list(e, &n.keys, |node, e| {
+        super::emit_node(node, e);
+        if n.without_overlaps && n.keys.last().is_some_and(|last| std::ptr::eq(last, node)) {
+            e.space();
+            e.token(TokenKind::WITHOUT_KW);
+            e.space();
+            e.token(TokenKind::OVERLAPS_KW);
+        }
+    });
+}
+
+/// Emits a column of a foreign key, the last one preceded by `PERIOD` (since Postgres 18) if
+/// `with_period` is set.
+fn emit_period_column(e: &mut EventEmitter, node: &Node, columns: &[Node], with_period: bool) {
+    if with_period && columns.last().is_some_and(|last| std::ptr::eq(last, node)) {
+        e.token(TokenKind::PERIOD_KW);
+        e.space();
+    }
+    super::emit_node(node, e);
+}
+
+/// Emits one element of an exclusion constraint: `column WITH operator`.
+fn emit_exclusion(exclusion: &pgls_query::Node, e: &mut EventEmitter) {
+    let exclusion_list = assert_node_variant!(List, exclusion);
+    debug_assert!(exclusion_list.items.len() >= 2);
+
+    if let Some(index_elem) = exclusion_list.items.first() {
+        super::emit_node(index_elem, e);
+    }
+
+    if let Some(operators) = exclusion_list.items.get(1) {
+        e.space();
+        e.token(TokenKind::WITH_KW);
+        e.space();
+
+        match operators.node.as_ref() {
+            Some(pgls_query::NodeEnum::List(op_list)) => {
+                for (op_idx, op) in op_list.items.iter().enumerate() {
+                    if op_idx > 0 {
+                        e.token(TokenKind::COMMA);
+                        e.space();
+                    }
+                    emit_exclusion_operator(e, op);
+                }
+            }
+            _ => emit_exclusion_operator(e, operators),
         }
     }
 }
@@ -523,7 +629,7 @@ fn emit_foreign_key_action(
     // Caller handles line break - we just emit the action
     e.token(TokenKind::ON_KW);
     e.space();
-    e.token(TokenKind::IDENT(event.to_string()));
+    super::emit_keyword(e, event);
     e.space();
 
     match action {
@@ -540,9 +646,7 @@ fn emit_foreign_key_action(
 
             if !set_cols.is_empty() {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, set_cols, super::emit_node);
-                e.token(TokenKind::R_PAREN);
+                emit_parenthesized_list(e, set_cols, super::emit_node);
             }
         }
         "d" => {
@@ -552,9 +656,7 @@ fn emit_foreign_key_action(
 
             if !set_cols.is_empty() {
                 e.space();
-                e.token(TokenKind::L_PAREN);
-                emit_comma_separated_list(e, set_cols, super::emit_node);
-                e.token(TokenKind::R_PAREN);
+                emit_parenthesized_list(e, set_cols, super::emit_node);
             }
         }
         "a" => {

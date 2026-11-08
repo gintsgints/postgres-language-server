@@ -1,7 +1,7 @@
 use pgls_query::Node;
 
-use crate::emitter::{EventEmitter, LineType};
-use crate::{CommaStyle, TokenKind};
+use crate::emitter::{EventEmitter, GroupKind, LineType};
+use crate::{CommaStyle, Layout, TokenKind};
 
 /// Controls the spacing behavior after separators in list helpers
 #[derive(Clone, Copy, Default)]
@@ -11,6 +11,8 @@ pub(super) enum ListSeparatorSpacing {
     SoftOrSpace,
     /// Use `e.space()` - always a space, never wraps
     Space,
+    /// Always break between items.
+    Hard,
 }
 
 /// Emit a comma-separated list with configurable spacing behavior
@@ -40,6 +42,7 @@ pub(super) fn emit_comma_separated_list_with_spacing<F>(
                 match spacing {
                     ListSeparatorSpacing::SoftOrSpace => e.line(LineType::Soft),
                     ListSeparatorSpacing::Space => {}
+                    ListSeparatorSpacing::Hard => e.line(LineType::Hard),
                 }
                 e.token(TokenKind::COMMA);
                 e.space();
@@ -48,6 +51,7 @@ pub(super) fn emit_comma_separated_list_with_spacing<F>(
                 match spacing {
                     ListSeparatorSpacing::SoftOrSpace => e.line(LineType::SoftOrSpace),
                     ListSeparatorSpacing::Space => e.space(),
+                    ListSeparatorSpacing::Hard => e.line(LineType::Hard),
                 }
             }
         }
@@ -63,25 +67,45 @@ where
     emit_comma_separated_list_with_spacing(e, nodes, ListSeparatorSpacing::SoftOrSpace, render);
 }
 
+/// Emits `(a, b, c)`: on one line when it fits, otherwise with each item on its own line, one level
+/// deeper, and the closing parenthesis back on its own line.
+pub(super) fn emit_parenthesized_list<F>(e: &mut EventEmitter, nodes: &[Node], render: F)
+where
+    F: Fn(&Node, &mut EventEmitter),
+{
+    e.group_start(GroupKind::List);
+    e.token(TokenKind::L_PAREN);
+    e.indent_start();
+    e.line(LineType::Soft);
+    emit_comma_separated_list(e, nodes, render);
+    e.indent_end();
+    e.line(LineType::Soft);
+    e.token(TokenKind::R_PAREN);
+    e.group_end();
+}
+
 /// Emit a comma-separated list that packs as many items as possible on each line.
 pub(super) fn emit_fill_comma_separated_list<F>(e: &mut EventEmitter, nodes: &[Node], render: F)
 where
     F: Fn(&Node, &mut EventEmitter),
 {
-    let leading = matches!(e.config().comma_style, CommaStyle::Leading);
-
     for (i, n) in nodes.iter().enumerate() {
         if i > 0 {
-            if leading {
-                e.line(LineType::FillNoSpace);
-                e.token(TokenKind::COMMA);
-                e.space();
-            } else {
-                e.token(TokenKind::COMMA);
-                e.line(LineType::Fill);
-            }
+            emit_fill_comma_separator(e);
         }
         render(n, e);
+    }
+}
+
+/// Emits the comma between two items of a list that packs as many items as possible on each line.
+pub(super) fn emit_fill_comma_separator(e: &mut EventEmitter) {
+    if matches!(e.config().comma_style, CommaStyle::Leading) {
+        e.line(LineType::FillNoSpace);
+        e.token(TokenKind::COMMA);
+        e.space();
+    } else {
+        e.token(TokenKind::COMMA);
+        e.line(LineType::Fill);
     }
 }
 
@@ -106,7 +130,12 @@ pub(super) fn emit_comma_separated_list_with_layout_break<F>(
                     e.take_own_line_leading_comments_at(location);
                 }
 
-                super::emit_layout_break(e);
+                // As in `emit_comma_separated_list_with_spacing`, the break before a leading
+                // comma disappears when the list fits, so a single line reads "a, b".
+                match e.config().layout {
+                    Layout::Expanded => e.line(LineType::Hard),
+                    Layout::Fit => e.line(LineType::Soft),
+                }
                 e.token(TokenKind::COMMA);
                 e.space();
             } else {

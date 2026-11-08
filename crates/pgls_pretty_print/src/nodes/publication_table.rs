@@ -13,18 +13,14 @@ pub(super) fn emit_publication_table(e: &mut EventEmitter, n: &PublicationTable)
 
     if !n.columns.is_empty() {
         e.space();
-        e.token(TokenKind::L_PAREN);
-        super::node_list::emit_comma_separated_list(e, &n.columns, super::emit_node);
-        e.token(TokenKind::R_PAREN);
+        super::node_list::emit_parenthesized_list(e, &n.columns, super::emit_node);
     }
 
     if let Some(ref where_clause) = n.where_clause {
         e.line(LineType::SoftOrSpace);
         e.token(TokenKind::WHERE_KW);
         e.space();
-        e.token(TokenKind::L_PAREN);
-        super::emit_clause_condition(e, where_clause);
-        e.token(TokenKind::R_PAREN);
+        super::emit_parenthesized_condition(e, GroupKind::PublicationTable, where_clause);
     }
 
     e.group_end();

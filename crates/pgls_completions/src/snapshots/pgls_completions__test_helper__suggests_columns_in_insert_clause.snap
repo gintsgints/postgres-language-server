@@ -75,6 +75,16 @@ values - values (Keyword)
 --------------
 
 insert into instruments (|
+
+Results:
+id - public.instruments.id (Column)
+name - public.instruments.name (Column)
+z - public.instruments.z (Column)
+a - public.others.a (Column)
+b - public.others.b (Column)
+
+--------------
+
 insert into instruments (|)
 
 Results:
@@ -164,11 +174,11 @@ insert into instruments (id, name) values (1, '|)
 insert into instruments (id, name) values (1, 'my_bass'); |
 
 Results:
+alter - alter (Keyword)
 copy - copy (Keyword)
 create - create (Keyword)
+delete - delete (Keyword)
 drop - drop (Keyword)
-insert - insert (Keyword)
-reset - reset (Keyword)
 
 --------------
 
@@ -232,6 +242,16 @@ values - values (Keyword)
 --------------
 
 insert into instruments (|
+
+Results:
+id - public.instruments.id (Column)
+name - public.instruments.name (Column)
+z - public.instruments.z (Column)
+a - public.others.a (Column)
+b - public.others.b (Column)
+
+--------------
+
 insert into instruments (|)
 
 Results:
@@ -257,9 +277,9 @@ identity_increment - information_schema.columns.identity_increment (Column)
 insert into instruments ("id", |)
 
 Results:
-id - public.instruments.id (Column)
 name - public.instruments.name (Column)
 z - public.instruments.z (Column)
+id - public.instruments.id (Column)
 a - public.others.a (Column)
 b - public.others.b (Column)
 
@@ -268,9 +288,9 @@ b - public.others.b (Column)
 insert into instruments ("id", "|)
 
 Results:
-id" - public.instruments.id (Column)
 name" - public.instruments.name (Column)
 z" - public.instruments.z (Column)
+id" - public.instruments.id (Column)
 a" - public.others.a (Column)
 b" - public.others.b (Column)
 
@@ -279,9 +299,9 @@ b" - public.others.b (Column)
 insert into instruments ("id", "|")
 
 Results:
-id - public.instruments.id (Column)
 name - public.instruments.name (Column)
 z - public.instruments.z (Column)
+id - public.instruments.id (Column)
 a - public.others.a (Column)
 b - public.others.b (Column)
 
@@ -319,9 +339,9 @@ insert into instruments ("id", "name") values (|
 insert into instruments ("id", "name") values (|)
 
 Results:
+z - public.instruments.z (Column)
 id - public.instruments.id (Column)
 name - public.instruments.name (Column)
-z - public.instruments.z (Column)
 default - default (Keyword)
 a - public.others.a (Column)
 
@@ -331,9 +351,9 @@ insert into instruments ("id", "name") values (1|)
 insert into instruments ("id", "name") values (1, |)
 
 Results:
+z - public.instruments.z (Column)
 id - public.instruments.id (Column)
 name - public.instruments.name (Column)
-z - public.instruments.z (Column)
 default - default (Keyword)
 a - public.others.a (Column)
 
@@ -343,11 +363,11 @@ insert into instruments ("id", "name") values (1, '|)
 insert into instruments ("id", "name") values (1, 'my_bass'); |
 
 Results:
+alter - alter (Keyword)
 copy - copy (Keyword)
 create - create (Keyword)
+delete - delete (Keyword)
 drop - drop (Keyword)
-insert - insert (Keyword)
-reset - reset (Keyword)
 
 --------------
 

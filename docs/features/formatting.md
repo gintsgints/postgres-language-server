@@ -2,11 +2,22 @@
 
 > **Preview Feature**: The formatter is currently in preview. We'd love feedback from early adopters! Please report any issues or unexpected output at [GitHub Issues](https://github.com/supabase-community/postgres-language-server/issues).
 
-## Known Limitations
-
 The language server provides SQL formatting that produces consistent, readable code. Built on Postgres' own parser, the formatter ensures 100% syntax compatibility with your SQL.
 
-Comments are not processed during formatting. They get removed before formatting and restored after.
+## What the formatter changes
+
+The formatter changes whitespace, line breaks, the case of keywords, types and constants, and quotes that an identifier does not need. It does not change what is written:
+
+- Schema qualifiers stay as written, `pg_catalog.` included.
+- Function and `DO` bodies are kept byte for byte, and always dollar-quoted with `$$` (or `$body$` when the body contains `$$`), whatever quotes they were written with. Only `language sql` bodies are reformatted, unless `skipFnBodies` is set.
+- String literals are kept as written.
+- Function signatures keep their argument names and modes, in `ALTER FUNCTION`, `GRANT` and `DROP` as well.
+- Identifiers that need quotes keep them: mixed case, reserved words such as `"user"`, and special characters.
+- Comments stay where they were written, including comments at the end of a line.
+
+The formatter checks every statement: if the formatted statement would not parse to the same tree as the original, the statement is left as written and a diagnostic is reported.
+
+Between statements, the formatter keeps at most one blank line, and removes blank lines at the start and the end of the file.
 
 ## Configuration
 
@@ -42,11 +53,86 @@ Configure formatting behavior in your `postgres-language-server.jsonc`:
 | `typeCase` | `"lower"` | Casing for data types (text, int, varchar): `"upper"` or `"lower"` |
 | `commaStyle` | `"trailing"` | Where a comma sits when a list breaks: `"trailing"` or `"leading"` |
 | `logicalOperatorPlacement` | `"trailing"` | Where `AND` and `OR` sit when a condition breaks: `"trailing"` or `"leading"` |
-| `layout` | `"fit"` | How a statement is laid out: `"fit"` breaks only past the line width, `"expanded"` always breaks between clauses |
+| `layout` | `"fit"` | How a statement is laid out: `"fit"` breaks only past the line width, `"expanded"` always breaks between clauses, between select list items, before every `AND`/`OR` and before every `CASE` branch (see below) |
+| `valuesRowLayout` | `"fit"` | How `VALUES` rows are laid out: `"fit"` breaks only past the line width, `"expanded"` puts each tuple on its own indented line. `commaStyle` controls commas between rows as well as inside tuples |
 | `castStyle` | `"cast"` | How an explicit cast is spelled: `"cast"` for `CAST(x AS t)`, `"operator"` for `x::t` |
-| `clauseBodyStyle` | `"break"` | Where a clause body starts: `"break"` for a new line, `"compact"` to keep the first element on the keyword line |
+| `clauseBodyStyle` | `"break"` | Where a clause body starts: `"break"` for a new line, `"compact"` to keep the first element on the keyword line. Compact also keeps a select list of a single item on the `SELECT` line |
 | `isolateSemicolon` | `false` | Put the terminating semicolon on its own line when the statement spans several lines |
+| `skipFnBodies` | `false` | Keep `language sql` function bodies as written instead of formatting them |
 | `functionArgumentGroups` | `{}` (plus built-in defaults, see below) | Function names mapped to the number of adjacent arguments that should stay together when wrapping |
+
+With `valuesRowLayout: "expanded"` and `commaStyle: "leading"`, each `VALUES`
+tuple starts on its own indented line, even when the rows fit within `lineWidth`:
+
+```sql
+values
+  ('MONTHLY', 1)
+  , ('QUARTERLY', 3);
+```
+
+The expressions inside each tuple stay on one line when they fit. This option
+applies to `INSERT`, standalone `VALUES`, and `VALUES` in subqueries and CTEs,
+independently of `layout` and `clauseBodyStyle`.
+
+`layout: "expanded"` puts every clause, every select list item and every
+operand of an `AND`/`OR` chain on its own line, even when the statement would
+fit on one. A subquery made of a select list alone, such as
+`(select auth.uid())`, and the condition of a `CHECK` constraint have no
+clauses to break between, so they follow the line width instead:
+
+```sql
+select
+  id,
+  name
+from
+  users
+where
+  active and
+  organization_id = (select auth.uid());
+```
+
+With `layout: "expanded"`, a `CASE` expression puts every `WHEN` and `ELSE`
+on its own line, one indent level in from where `CASE` starts, `THEN` one
+level further in, and `END` back under `CASE`. This holds wherever the `CASE`
+starts, after a leading comma for instance. A `CASE` nested as the result of a
+`THEN` or `ELSE` is indented from that line instead, with `END` under `THEN` or
+`ELSE`, so that deep nesting doesn't run past the line width. A `WHEN`
+condition that breaks continues one level in from `WHEN`:
+
+```sql
+select
+  id
+  , case
+      when status = 'active'
+        and deleted_at is null
+        then 'live'
+      else 'archived'
+    end as state
+from
+  accounts;
+```
+
+With `indentStyle: "tabs"`, the indent levels are written as tabs and the rest
+of an alignment, such as the two columns of `, ` before `case` above, as
+spaces. The columns only line up when the editor's tab width equals
+`indentSize`.
+
+With `clauseBodyStyle: "compact"`, the first relation stays on the `FROM` line
+and the condition on the `WHERE`, `HAVING`, or `ON` line. A select list of a
+single item stays on the `SELECT` line, while a list of several items still
+puts one item per line:
+
+```sql
+select count(*)
+from memberships
+where memberships.user_id = $1 and memberships.role = 'admin' and memberships.active;
+
+select
+  memberships.user_id,
+  memberships.role
+from memberships
+where memberships.organization_id = $1 and memberships.active;
+```
 
 `functionArgumentGroups` matches the final, unqualified function name
 case-insensitively. A group size of `2` is useful for functions whose arguments
@@ -107,7 +193,7 @@ SELECT * FROM users WHERE active = TRUE;
 Format files using the CLI:
 
 ```bash
-# Format and show diff
+# Check formatting and show a diff for every statement that would change
 postgres-language-server format file.sql
 
 # Format and write changes
@@ -117,9 +203,46 @@ postgres-language-server format file.sql --write
 postgres-language-server format migrations/ --write
 ```
 
+### Check mode
+
+Without `--write`, `format` does not modify any file. For every statement that would be reformatted it prints a diagnostic with the file path and a diff to stderr, followed by a summary (`Processed N files ... Found N errors.`). The command exits with a non-zero code if any file is not formatted or could not be formatted (e.g. because of a syntax error), and with `0` otherwise. This makes it suitable for CI:
+
+```bash
+postgres-language-server format migrations/
+```
+
+`--staged` and `--changed` (optionally with `--since=<REF>`) limit the run to the files staged for commit or changed compared to your default branch.
+
+### Formatting stdin
+
+Use `--stdin-file-path=<PATH>` to format SQL piped through stdin, for example from an editor or a script. Only the formatted SQL is printed to stdout:
+
+```bash
+echo "SELECT a,b FROM t;" | postgres-language-server format --stdin-file-path=query.sql
+# select a, b from t;
+```
+
+The file doesn't need to exist. Its path is used to apply the project configuration (for example, a path matching `files.ignore` is printed back unchanged) and to label diagnostics. If a statement cannot be formatted, it is printed unchanged, its diagnostics are written to stderr, and the command exits with a non-zero code. When the formatter is disabled, the input is printed unchanged. `--stdin-file-path` cannot be combined with file paths, `--write`, `--staged` or `--changed`.
+
+### Formatting generated SQL
+
+To format the SQL that a tool like the Supabase CLI generates, run `format --write` after each generation. See [Formatting Declarative Schemas](../guides/formatting_declarative_schemas.md).
+
 ## Editor Integration
 
 The formatter integrates with your editor via the Language Server Protocol. Use your editor's format document command (typically bound to a keyboard shortcut) to format SQL files.
+
+## JavaScript API
+
+The `@postgres-language-server/wasm` package formats SQL in-process, with the same options as the `format` section of the configuration file:
+
+```typescript
+import { format } from "@postgres-language-server/wasm";
+
+const sql = await format('CREATE TABLE "public"."t" ("id" "uuid" NOT NULL)', {
+  keywordCase: "lower",
+});
+```
 
 ## Ignoring Files
 

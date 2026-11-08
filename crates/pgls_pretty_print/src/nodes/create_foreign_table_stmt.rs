@@ -1,4 +1,4 @@
-use super::node_list::emit_comma_separated_list;
+use super::node_list::{emit_comma_separated_list, emit_parenthesized_list};
 use crate::{
     TokenKind,
     emitter::{EventEmitter, GroupKind},
@@ -48,10 +48,10 @@ pub(super) fn emit_create_foreign_table_stmt(e: &mut EventEmitter, n: &CreateFor
             e.token(TokenKind::L_PAREN);
             if !base.table_elts.is_empty() {
                 e.indent_start();
-                e.line(crate::emitter::LineType::SoftOrSpace);
+                e.line(crate::emitter::LineType::Soft);
                 emit_comma_separated_list(e, &base.table_elts, super::emit_node);
                 e.indent_end();
-                e.line(crate::emitter::LineType::SoftOrSpace);
+                e.line(crate::emitter::LineType::Soft);
             }
             e.token(TokenKind::R_PAREN);
         }
@@ -68,15 +68,11 @@ pub(super) fn emit_create_foreign_table_stmt(e: &mut EventEmitter, n: &CreateFor
         e.space();
         e.token(TokenKind::OPTIONS_KW);
         e.space();
-        e.token(TokenKind::L_PAREN);
-        emit_comma_separated_list(e, &n.options, |n, e| {
+        emit_parenthesized_list(e, &n.options, |n, e| {
             let def_elem = assert_node_variant!(DefElem, n);
             super::emit_options_def_elem(e, def_elem);
         });
-        e.token(TokenKind::R_PAREN);
     }
-
-    e.token(TokenKind::SEMICOLON);
 
     e.group_end();
 }

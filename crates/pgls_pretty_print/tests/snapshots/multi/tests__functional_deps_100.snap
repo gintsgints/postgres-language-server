@@ -1,10 +1,9 @@
 ---
 source: crates/pgls_pretty_print/tests/tests.rs
 input_file: crates/pgls_pretty_print/tests/data/multi/functional_deps.sql
-snapshot_kind: text
 ---
 create temporary table articles (
-  id int constraint "articles_pkey" primary key,
+  id int constraint articles_pkey primary key,
   keywords text,
   title text unique not null,
   body text unique,
@@ -36,8 +35,7 @@ from
   articles as a,
   articles_in_category as aic
 where
-  a.id = aic.article_id and
-  aic.category_id in (14, 62, 70, 53, 138)
+  a.id = aic.article_id and aic.category_id in (14, 62, 70, 53, 138)
 group by a.id;
 
 select
@@ -50,8 +48,7 @@ from
   articles as a,
   articles_in_category as aic
 where
-  a.id = aic.article_id and
-  aic.category_id in (14, 62, 70, 53, 138)
+  a.id = aic.article_id and aic.category_id in (14, 62, 70, 53, 138)
 group by aic.article_id,
   aic.category_id;
 
@@ -62,10 +59,7 @@ select
   a.body,
   a.created
 from
-  articles as a
-  inner join
-    articles_in_category as aic
-  on a.id = aic.article_id
+  articles as a inner join articles_in_category as aic on a.id = aic.article_id
 where
   aic.category_id in (14, 62, 70, 53, 138)
 group by a.id;
@@ -77,10 +71,7 @@ select
   a.body,
   a.created
 from
-  articles as a
-  inner join
-    articles_in_category as aic
-  on a.id = aic.article_id
+  articles as a inner join articles_in_category as aic on a.id = aic.article_id
 where
   aic.category_id in (14, 62, 70, 53, 138)
 group by aic.article_id,
@@ -89,10 +80,7 @@ group by aic.article_id,
 select
   aic.changed
 from
-  articles as a
-  inner join
-    articles_in_category as aic
-  on a.id = aic.article_id
+  articles as a inner join articles_in_category as aic on a.id = aic.article_id
 where
   aic.category_id in (14, 62, 70, 53, 138)
 group by aic.category_id,
@@ -101,10 +89,7 @@ group by aic.category_id,
 select
   aic.changed
 from
-  articles as a
-  inner join
-    articles_in_category as aic
-  on a.id = aic.article_id
+  articles as a inner join articles_in_category as aic on a.id = aic.article_id
 where
   aic.category_id in (14, 62, 70, 53, 138)
 group by aic.article_id;
@@ -123,12 +108,9 @@ create temporary table sales (
 select
   product_id,
   p.name,
-  SUM(s.units) * p.price as sales
+  sum(s.units) * p.price as sales
 from
-  products as p
-  left outer join
-    sales as s
-  using ("product_id")
+  products as p left outer join sales as s using (product_id)
 group by product_id,
   p.name,
   p.price;
@@ -136,12 +118,9 @@ group by product_id,
 select
   product_id,
   p.name,
-  SUM(s.units) * p.price as sales
+  sum(s.units) * p.price as sales
 from
-  products as p
-  left outer join
-    sales as s
-  using ("product_id")
+  products as p left outer join sales as s using (product_id)
 group by product_id;
 
 alter table products
@@ -150,12 +129,9 @@ alter table products
 select
   product_id,
   p.name,
-  SUM(s.units) * p.price as sales
+  sum(s.units) * p.price as sales
 from
-  products as p
-  left outer join
-    sales as s
-  using ("product_id")
+  products as p left outer join sales as s using (product_id)
 group by product_id;
 
 create temporary table node (
@@ -197,26 +173,10 @@ where
 group by u.uid;
 
 create temporary view fdv1
-as select
-  id,
-  keywords,
-  title,
-  body,
-  created
-from
-  articles
-group by body;
+as select id, keywords, title, body, created from articles group by body;
 
 create temporary view fdv1
-as select
-  id,
-  keywords,
-  title,
-  body,
-  created
-from
-  articles
-group by id;
+as select id, keywords, title, body, created from articles group by id;
 
 alter table articles
   drop constraint articles_pkey;
@@ -231,10 +191,7 @@ as select
   aic.category_id,
   aic.changed
 from
-  articles as a
-  inner join
-    articles_in_category as aic
-  on a.id = aic.article_id
+  articles as a inner join articles_in_category as aic on a.id = aic.article_id
 where
   aic.category_id in (14, 62, 70, 53, 138)
 group by a.id,
@@ -250,25 +207,9 @@ alter table articles_in_category
 drop view fdv2;
 
 create temporary view fdv3
-as select
-  id,
-  keywords,
-  title,
-  body,
-  created
-from
-  articles
-group by id
+as select id, keywords, title, body, created from articles group by id
 union
-select
-  id,
-  keywords,
-  title,
-  body,
-  created
-from
-  articles
-group by id;
+select id, keywords, title, body, created from articles group by id;
 
 alter table articles
   drop constraint articles_pkey;
@@ -276,19 +217,14 @@ alter table articles
 drop view fdv3;
 
 create temporary view fdv4
-as select
-  *
-from
-  articles
-where
-  title in (select title from articles group by id);
+as select * from articles where title in (select title from articles group by id);
 
 alter table articles
   drop constraint articles_pkey;
 
 drop view fdv4;
 
-prepare foo as select id, keywords, title, body, created from articles group by id;;
+prepare foo as select id, keywords, title, body, created from articles group by id;
 
 execute foo;
 

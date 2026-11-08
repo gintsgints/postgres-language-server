@@ -1,7 +1,16 @@
+use std::rc::Rc;
+
 use pgls_query::protobuf::RangeSubselect;
 
-use super::{Resolver, alias::apply_alias, resolve_node};
-use crate::resolve::scope::{Item, Level};
+use super::{
+    Resolver,
+    alias::{apply_alias, apply_typed_alias},
+    resolve_node,
+};
+use crate::resolve::{
+    ColumnSource,
+    scope::{Item, ItemSource, Level},
+};
 
 /// A subquery in FROM. Only a LATERAL subquery sees the FROM items before it. Port of
 /// [`transformRangeSubselect`].
@@ -26,19 +35,22 @@ pub(super) fn resolve_range_subselect(
         columns
     });
     let alias = n.alias.as_ref();
+    let source = match &columns {
+        Some(names) if r.collects_references() => Some(Rc::new(ItemSource::derived(
+            r,
+            ColumnSource::Subquery {
+                alias: alias.map(|alias| alias.aliasname.clone()),
+            },
+            names,
+            typed_columns.as_deref(),
+        ))),
+        _ => None,
+    };
     let mut item = Item::named(
         alias.map(|alias| alias.aliasname.clone()),
         apply_alias(columns, alias),
     );
-    item.typed_columns = typed_columns.map(|mut columns| {
-        if let Some(alias) = alias
-            && let Some(names) = super::string::string_values(&alias.colnames)
-        {
-            for (column, name) in columns.iter_mut().zip(names) {
-                column.name = name;
-            }
-        }
-        columns
-    });
+    item.typed_columns = apply_typed_alias(typed_columns, alias);
+    item.source = source;
     item
 }

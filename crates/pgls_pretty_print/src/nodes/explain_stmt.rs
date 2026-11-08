@@ -15,15 +15,9 @@ pub(super) fn emit_explain_stmt(e: &mut EventEmitter, n: &ExplainStmt) {
     // EXPLAIN options use "name value" syntax without equals sign
     if !n.options.is_empty() {
         e.space();
-        e.token(TokenKind::L_PAREN);
-        for (idx, opt) in n.options.iter().enumerate() {
-            if idx > 0 {
-                e.token(TokenKind::COMMA);
-                e.space();
-            }
-            emit_explain_option(e, opt);
-        }
-        e.token(TokenKind::R_PAREN);
+        super::node_list::emit_parenthesized_list(e, &n.options, |opt, e| {
+            emit_explain_option(e, opt)
+        });
     }
 
     // The query to explain
@@ -37,9 +31,8 @@ pub(super) fn emit_explain_stmt(e: &mut EventEmitter, n: &ExplainStmt) {
 
 fn emit_explain_option(e: &mut EventEmitter, node: &pgls_query::Node) {
     if let Some(NodeEnum::DefElem(def)) = &node.node {
-        // Emit the option name in uppercase
         if !def.defname.is_empty() {
-            e.token(TokenKind::IDENT(def.defname.to_uppercase()));
+            super::emit_keyword(e, &def.defname);
         }
 
         // Emit the option value if present (no equals sign for EXPLAIN)

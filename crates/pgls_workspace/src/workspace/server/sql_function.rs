@@ -1,261 +1,37 @@
-use pgls_query::protobuf::FunctionParameterMode;
-use pgls_text_size::TextRange;
+use pgls_query_ext::utils::{find_option_value, find_option_value_mut};
 
-#[derive(Debug, Clone)]
-pub struct ArgType {
-    pub schema: Option<String>,
-    pub name: String,
-    pub is_array: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SQLFunctionArg {
-    pub name: Option<String>,
-    pub type_: ArgType,
-}
-
-#[derive(Debug, Clone)]
-pub struct SQLFunctionSignature {
-    #[allow(dead_code)]
-    pub schema: Option<String>,
-    pub name: String,
-    pub args: Vec<SQLFunctionArg>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SQLFunctionBody {
-    pub range: TextRange,
-    pub body: String,
-}
-
-/// Extracts the function signature from a SQL function definition
-pub fn get_sql_fn_signature(ast: &pgls_query::NodeEnum) -> Option<SQLFunctionSignature> {
-    let create_fn = match ast {
-        pgls_query::NodeEnum::CreateFunctionStmt(cf) => cf,
-        _ => return None,
+/// Puts the formatted body into `CREATE FUNCTION ... AS '<body>'` for a `LANGUAGE sql` function.
+///
+/// A reformatted body goes on lines of its own between the quotes. A body that formatting leaves
+/// alone keeps the layout it was written with. Returns true when the body was replaced.
+pub fn set_formatted_sql_fn_body(ast: &mut pgls_query::NodeEnum, formatted: &str) -> bool {
+    let Some(body) = sql_fn_body_mut(ast) else {
+        return false;
     };
 
-    // Extract language from function options
-    let language = pgls_query_ext::utils::find_option_value(create_fn, "language")?;
-
-    // Only process SQL functions
-    if language != "sql" {
-        return None;
-    }
-
-    let fn_name = pgls_query_ext::utils::parse_name(&create_fn.funcname)?;
-
-    // we return None if anything is not expected
-    let mut fn_args = Vec::new();
-    for arg in &create_fn.parameters {
-        if let Some(pgls_query::NodeEnum::FunctionParameter(node)) = &arg.node {
-            // The body only sees the input parameters, by name and as `$n`
-            // ([`get_func_input_arg_names`] in [`prepare_sql_fn_parse_info`]). `OUT` and
-            // `RETURNS TABLE` columns only describe the result: their names are not in scope,
-            // and they don't count for `$n`, so `$1` in `f(OUT x int, a text)` is `a`. `INOUT`
-            // and `VARIADIC` parameters are inputs and stay. The position in `fn_args` is the
-            // `n` of `$n`.
-            //
-            // [`get_func_input_arg_names`]: https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/fmgr/funcapi.c#L1522
-            // [`prepare_sql_fn_parse_info`]: https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/functions.c#L251
-            if matches!(
-                node.mode(),
-                FunctionParameterMode::FuncParamOut | FunctionParameterMode::FuncParamTable
-            ) {
-                continue;
-            }
-
-            let arg_name = (!node.name.is_empty()).then_some(node.name.clone());
-
-            let arg_type = node.arg_type.as_ref()?;
-            let type_name = pgls_query_ext::utils::parse_name(&arg_type.names)?;
-            fn_args.push(SQLFunctionArg {
-                name: arg_name,
-                type_: ArgType {
-                    schema: type_name.0,
-                    name: type_name.1,
-                    is_array: node
-                        .arg_type
-                        .as_ref()
-                        .map(|t| !t.array_bounds.is_empty())
-                        .unwrap_or(false),
-                },
-            });
-        } else {
-            return None;
-        }
-    }
-
-    Some(SQLFunctionSignature {
-        schema: fn_name.0,
-        name: fn_name.1,
-        args: fn_args,
-    })
-}
-
-/// Extracts the SQL body from a function definition
-pub fn get_sql_fn_body(ast: &pgls_query::NodeEnum, content: &str) -> Option<SQLFunctionBody> {
-    let create_fn = match ast {
-        pgls_query::NodeEnum::CreateFunctionStmt(cf) => cf,
-        _ => return None,
-    };
-
-    // Extract language from function options
-    let language = pgls_query_ext::utils::find_option_value(create_fn, "language")?;
-
-    // Only process SQL functions
-    if language != "sql" {
-        return None;
-    }
-
-    // Extract SQL body from function options
-    let sql_body = pgls_query_ext::utils::find_option_value(create_fn, "as")?;
-
-    // Find the range of the SQL body in the content
-    let start = content.find(&sql_body)?;
-    let end = start + sql_body.len();
-
-    let range = TextRange::new(start.try_into().unwrap(), end.try_into().unwrap());
-
-    Some(SQLFunctionBody {
-        range,
-        body: sql_body.clone(),
-    })
-}
-
-/// Replaces the SQL function body in CREATE FUNCTION ... AS '<body>' for LANGUAGE SQL functions.
-/// Returns true when a body was replaced.
-pub fn set_sql_fn_body(ast: &mut pgls_query::NodeEnum, new_body: &str) -> bool {
-    let create_fn = match ast {
-        pgls_query::NodeEnum::CreateFunctionStmt(cf) => cf,
-        _ => return false,
-    };
-
-    let language = pgls_query_ext::utils::find_option_value(create_fn, "language");
-    if language.as_deref() != Some("sql") {
+    if body.trim() == formatted.trim() {
         return false;
     }
 
-    for option in &mut create_fn.options {
-        let Some(pgls_query::NodeEnum::DefElem(def_elem)) = option.node.as_mut() else {
-            continue;
-        };
+    *body = format!("\n{formatted}\n");
+    true
+}
 
-        if def_elem.defname != "as" {
-            continue;
-        }
+fn sql_fn_body_mut(ast: &mut pgls_query::NodeEnum) -> Option<&mut String> {
+    let pgls_query::NodeEnum::CreateFunctionStmt(create_fn) = ast else {
+        return None;
+    };
 
-        let Some(arg) = def_elem.arg.as_mut() else {
-            continue;
-        };
-
-        match arg.node.as_mut() {
-            Some(pgls_query::NodeEnum::String(s)) => {
-                s.sval = new_body.to_string();
-                return true;
-            }
-            Some(pgls_query::NodeEnum::List(list)) => {
-                if list.items.len() == 1
-                    && let Some(pgls_query::NodeEnum::String(s)) = list.items[0].node.as_mut()
-                {
-                    s.sval = new_body.to_string();
-                    return true;
-                }
-            }
-            _ => {}
-        }
+    if find_option_value(create_fn, "language") != Some("sql") {
+        return None;
     }
 
-    false
+    find_option_value_mut(create_fn, "as")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sql_function_signature() {
-        let input = "CREATE FUNCTION add(test0 integer, test1 integer) RETURNS integer
-    AS 'select $1 + $2;'
-    LANGUAGE SQL
-    IMMUTABLE
-    RETURNS NULL ON NULL INPUT;";
-
-        let ast = pgls_query::parse(input).unwrap().into_root().unwrap();
-
-        let sig = get_sql_fn_signature(&ast);
-
-        assert!(sig.is_some());
-
-        let sig = sig.unwrap();
-
-        let arg1 = sig.args.first().unwrap();
-
-        assert_eq!(arg1.name, Some("test0".to_string()));
-        assert_eq!(arg1.type_.name, "int4");
-
-        let arg2 = sig.args.get(1).unwrap();
-        assert_eq!(arg2.name, Some("test1".to_string()));
-        assert_eq!(arg2.type_.name, "int4");
-    }
-
-    #[test]
-    fn output_parameters_are_not_arguments() {
-        let names = |input: &str| {
-            let ast = pgls_query::parse(input).unwrap().into_root().unwrap();
-            get_sql_fn_signature(&ast)
-                .unwrap()
-                .args
-                .into_iter()
-                .map(|arg| arg.name)
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            names(
-                "create function f(p_above bigint) returns table(id bigint, received_at timestamptz) language sql as 'select 1, now()'"
-            ),
-            [Some("p_above".to_string())]
-        );
-        assert_eq!(
-            names(
-                "create function f(out x int, a text, inout b int, variadic c int[]) language sql as 'select 1, 2'"
-            ),
-            [
-                Some("a".to_string()),
-                Some("b".to_string()),
-                Some("c".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn array_type() {
-        let input = "CREATE FUNCTION add(test0 integer[], test1 integer) RETURNS integer
-    AS 'select $1 + $2;'
-    LANGUAGE SQL
-    IMMUTABLE
-    RETURNS NULL ON NULL INPUT;";
-
-        let ast = pgls_query::parse(input).unwrap().into_root().unwrap();
-
-        let sig = get_sql_fn_signature(&ast);
-
-        assert!(sig.is_some());
-
-        let sig = sig.unwrap();
-
-        assert!(
-            sig.args
-                .iter()
-                .find(|arg| arg.type_.is_array)
-                .map(|arg| {
-                    assert_eq!(arg.type_.name, "int4");
-                    assert!(arg.type_.is_array);
-                })
-                .is_some()
-        );
-    }
 
     #[test]
     fn set_sql_function_body() {
@@ -266,15 +42,23 @@ mod tests {
 
         let mut ast = pgls_query::parse(input).unwrap().into_root().unwrap();
 
-        let changed = set_sql_fn_body(&mut ast, "select $1 + $2;");
-        assert!(changed);
+        assert!(set_formatted_sql_fn_body(&mut ast, "select $1 + $2;"));
 
         let create_fn = match &ast {
             pgls_query::NodeEnum::CreateFunctionStmt(stmt) => stmt,
             _ => panic!("Expected CreateFunctionStmt"),
         };
 
-        let body = pgls_query_ext::utils::find_option_value(create_fn, "as");
-        assert_eq!(body, Some("select $1 + $2;".to_string()));
+        let body = find_option_value(create_fn, "as");
+        assert_eq!(body, Some("\nselect $1 + $2;\n"));
+    }
+
+    #[test]
+    fn an_unchanged_sql_function_body_keeps_its_layout() {
+        let input = "CREATE FUNCTION one() RETURNS integer AS $$\n  select 1;\n$$ LANGUAGE SQL;";
+
+        let mut ast = pgls_query::parse(input).unwrap().into_root().unwrap();
+
+        assert!(!set_formatted_sql_fn_body(&mut ast, "select 1;"));
     }
 }

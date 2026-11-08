@@ -1,8 +1,13 @@
+// plpgsql_check reports on functions from the client, so a panic on unexpected output takes down
+// the server for every connected editor.
+#![warn(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 mod diagnostics;
 
 pub use diagnostics::PlPgSqlCheckDiagnostic;
 use diagnostics::create_diagnostics_from_check_result;
 use pgls_query::protobuf::CreateFunctionStmt;
+use pgls_query_ext::utils::{QualifiedName, find_option_value, qualified_name};
 use regex::Regex;
 use serde::Deserialize;
 pub use sqlx::postgres::PgSeverity;
@@ -68,9 +73,7 @@ fn should_check_function<'a>(
         _ => return None,
     };
 
-    if pgls_query_ext::utils::find_option_value(create_fn, "language")
-        != Some("plpgsql".to_string())
-    {
+    if find_option_value(create_fn, "language") != Some("plpgsql") {
         return None;
     }
 
@@ -92,8 +95,12 @@ fn is_trigger_function(create_fn: &CreateFunctionStmt) -> bool {
         .as_ref()
         .map(|n| {
             matches!(
-                pgls_query_ext::utils::parse_name(&n.names),
-                Some((None, name)) if name == "trigger"
+                qualified_name(&n.names),
+                Some(QualifiedName {
+                    schema: None,
+                    name: "trigger",
+                    ..
+                })
             )
         })
         .unwrap_or(false)
@@ -102,7 +109,7 @@ fn is_trigger_function(create_fn: &CreateFunctionStmt) -> bool {
 /// build the function identifier string used by plpgsql_check
 fn build_function_identifier(
     create_fn: &CreateFunctionStmt,
-    fn_schema: &Option<String>,
+    fn_schema: Option<&str>,
     fn_name: &str,
 ) -> String {
     let args = create_fn
@@ -114,12 +121,13 @@ fn build_function_identifier(
                 _ => return None,
             };
             let type_name_node = node.arg_type.as_ref()?;
-            let type_name = match pgls_query_ext::utils::parse_name(&type_name_node.names) {
-                Some((schema, name)) => match schema {
-                    Some(s) => format!("{s}.{name}"),
-                    None => name,
-                },
-                None => return None,
+            let type_name = match qualified_name(&type_name_node.names)? {
+                QualifiedName {
+                    schema: Some(schema),
+                    name,
+                    ..
+                } => format!("{schema}.{name}"),
+                QualifiedName { name, .. } => name.to_owned(),
             };
 
             if !type_name_node.array_bounds.is_empty() {
@@ -188,26 +196,34 @@ fn build_extra_params(options: &PlPgSqlCheckParams<'_>) -> String {
     }
 }
 
+/// Checks a PL/pgSQL function with plpgsql_check.
+///
+/// Returns `None` if the function was not checked, e.g. because the extension is not installed
+/// or because no trigger uses the trigger function.
 pub async fn check_plpgsql(
     params: PlPgSqlCheckParams<'_>,
-) -> Result<Vec<PlPgSqlCheckDiagnostic>, sqlx::Error> {
+) -> Result<Option<Vec<PlPgSqlCheckDiagnostic>>, sqlx::Error> {
     let create_fn = match should_check_function(params.ast, params.snapshot) {
         Some(stmt) => stmt,
-        None => return Ok(vec![]),
+        None => return Ok(None),
     };
 
-    let (fn_schema, fn_name) = match pgls_query_ext::utils::parse_name(&create_fn.funcname) {
-        Some(n) => n,
-        None => return Ok(vec![]),
+    let Some(QualifiedName {
+        schema: fn_schema,
+        name: fn_name,
+        ..
+    }) = qualified_name(&create_fn.funcname)
+    else {
+        return Ok(None);
     };
 
-    let fn_identifier = build_function_identifier(create_fn, &fn_schema, &fn_name);
+    let fn_identifier = build_function_identifier(create_fn, fn_schema, fn_name);
 
-    let fn_body = pgls_query_ext::utils::find_option_value(create_fn, "as")
+    let fn_body = find_option_value(create_fn, "as")
         .ok_or_else(|| sqlx::Error::Protocol("Failed to find function body".to_string()))?;
     let offset = params
         .sql
-        .find(&fn_body)
+        .find(fn_body)
         .ok_or_else(|| sqlx::Error::Protocol("Failed to find function body in SQL".to_string()))?;
     let is_trigger = is_trigger_function(create_fn);
 
@@ -223,6 +239,10 @@ pub async fn check_plpgsql(
 
     // make sure we run with "or replace"
     let sql_with_replace = if !create_fn.replace {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the pattern is a constant, which the tests of functions without `OR REPLACE` compile"
+        )]
         let re = Regex::new(r"(?i)\bCREATE\s+FUNCTION\b").unwrap();
         re.replace(params.sql, "CREATE OR REPLACE FUNCTION")
             .to_string()
@@ -235,14 +255,16 @@ pub async fn check_plpgsql(
 
     // run plpgsql_check and collect results with their relations
     let extra = build_extra_params(&params);
+    let mut checked = !is_trigger;
     let results_with_relations: Vec<(String, Option<String>)> = if is_trigger {
         let mut results = Vec::new();
 
         for trigger in params.snapshot.triggers.iter() {
             if trigger.proc_name == fn_name
-                && (fn_schema.is_none() || fn_schema.as_deref() == Some(&trigger.proc_schema))
+                && (fn_schema.is_none() || fn_schema == Some(trigger.proc_schema.as_str()))
             {
                 let relation = format!("{}.{}", trigger.table_schema, trigger.table_name);
+                checked = true;
 
                 let result: Option<String> = sqlx::query_scalar(&format!(
                     "select plpgsql_check_function('{fn_identifier}', '{relation}', format := 'json'{extra})"
@@ -275,6 +297,10 @@ pub async fn check_plpgsql(
 
     tx.rollback().await?;
 
+    if !checked {
+        return Ok(None);
+    }
+
     // Parse results and create diagnostics
     let mut diagnostics = Vec::new();
     for (result_json, relation) in results_with_relations {
@@ -283,11 +309,11 @@ pub async fn check_plpgsql(
         })?;
 
         let mut result_diagnostics =
-            create_diagnostics_from_check_result(&check_result, &fn_body, offset, relation);
+            create_diagnostics_from_check_result(&check_result, fn_body, offset, relation);
         diagnostics.append(&mut result_diagnostics);
     }
 
-    Ok(diagnostics)
+    Ok(Some(diagnostics))
 }
 
 #[cfg(all(test, not(target_os = "windows")))]
@@ -325,7 +351,8 @@ mod tests {
             incomment_options_usage_warning: false,
             constant_tracing: true,
         })
-        .await?;
+        .await?
+        .unwrap_or_default();
 
         let span_texts = diagnostics
             .iter()
@@ -503,16 +530,8 @@ mod tests {
             diagnostics[0].severity,
             pgls_diagnostics::Severity::Error
         ));
-        assert_eq!(
-            span_texts[0].as_deref(),
-            // the span starts at the keyword and omits the whitespace before/after $function$
-            Some(
-                r#"DECLRE r record; -- spelled declare wrong!
-            BEGIN
-                select * from t1;
-            END;"#
-            )
-        );
+        // the span is the token at the syntax error instead of the entire body
+        assert_eq!(span_texts[0].as_deref(), Some("DECLRE"));
     }
 
     #[sqlx::test(migrator = "pgls_test_utils::MIGRATIONS")]

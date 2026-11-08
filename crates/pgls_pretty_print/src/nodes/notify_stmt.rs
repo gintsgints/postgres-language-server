@@ -14,7 +14,7 @@ pub(super) fn emit_notify_stmt(e: &mut EventEmitter, n: &NotifyStmt) {
 
     if !n.conditionname.is_empty() {
         e.space();
-        super::emit_identifier(e, &n.conditionname);
+        super::emit_identifier_maybe_quoted(e, &n.conditionname);
     }
 
     // Optional payload
@@ -25,6 +25,5 @@ pub(super) fn emit_notify_stmt(e: &mut EventEmitter, n: &NotifyStmt) {
         emit_single_quoted_str(e, &n.payload);
     }
 
-    e.token(TokenKind::SEMICOLON);
     e.group_end();
 }

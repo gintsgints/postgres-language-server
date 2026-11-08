@@ -7,13 +7,14 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use pgls_analyse::{AnalysisFilter, RuleFilter};
+use pgls_analyse::{AnalysisFilter, Applicability, RuleFilter};
 use pgls_analyser::{
-    AnalysableStatement, Analyser, AnalyserConfig, AnalyserParams, LinterDiagnostic, LinterOptions,
-    UnparsableStatement,
+    AnalysableStatement, Analyser, AnalyserConfig, AnalyserParams, Direction, LinterDiagnostic,
+    LinterOptions, MigrationSection, RuleFix, UnparsableStatement,
 };
 use pgls_console::StdDisplay;
 use pgls_diagnostics::PrintDiagnostic;
+use pgls_text_size::{TextRange, TextSize};
 
 static TYPECHECK_CATALOG: OnceLock<Arc<pgls_catalog::CatalogBase>> = OnceLock::new();
 
@@ -112,39 +113,9 @@ fn rule_test(full_path: &'static str, _: &str, _: &str) {
         options: &options,
         filter,
     });
-
-    let split = pgls_statement_splitter::split(&query);
-
-    // Statements that don't parse are passed on as such, like the workspace does.
-    let mut stmts = Vec::new();
-    let mut unparsable = Vec::new();
-    for r in &split.ranges {
-        let text = &query[*r];
-        match pgls_query::parse(text) {
-            Ok(ast) => stmts.push(
-                AnalysableStatement::new(
-                    ast.into_root().expect("Failed to convert AST to root node"),
-                    *r,
-                )
-                .with_sql(text),
-            ),
-            Err(_) => unparsable.push(UnparsableStatement {
-                range: *r,
-                sql: text.to_owned(),
-            }),
-        }
-    }
-
-    // Typecheck rules use the test database's built-in catalog; user schemas are filtered out.
     let is_typecheck = group == pgls_analyser::TYPECHECK_GROUP;
-    let results = analyser.run(AnalyserParams {
-        stmts,
-        unparsable,
-        catalog_base: is_typecheck.then(typecheck_catalog),
-        search_path: vec!["public".into()],
-        typecheck: is_typecheck,
-        ..Default::default()
-    });
+
+    let results = analyse(&analyser, &query, is_typecheck);
 
     let mut snapshot = String::new();
     write_snapshot(&mut snapshot, query.as_str(), results.as_slice());
@@ -158,6 +129,148 @@ fn rule_test(full_path: &'static str, _: &str, _: &str) {
 
     let expectation = Expectation::from_file(&query);
     expectation.assert(results.as_slice());
+
+    assert_fixes_converge(&analyser, &query, is_typecheck);
+}
+
+fn analyse(analyser: &Analyser, query: &str, is_typecheck: bool) -> Vec<LinterDiagnostic> {
+    let split = pgls_statement_splitter::split(query);
+
+    // Statements that don't parse are passed on as such, like the workspace does. Like there,
+    // placeholders such as psql variables are parsed as parameters. The statements of a SQL
+    // function body follow the function, with its parameters in scope.
+    let mut stmts = Vec::new();
+    let mut unparsable = Vec::new();
+    for r in &split.ranges {
+        let text = &query[*r];
+        let conversion = pgls_lexer::convert_to_positional_params_with_metadata(text);
+        match pgls_query::parse(&conversion.sql) {
+            Ok(ast) => {
+                let root = ast.into_root().expect("Failed to convert AST to root node");
+                let body = sql_function_body(&root, text, *r);
+                stmts.push(
+                    AnalysableStatement::new(root, *r)
+                        .with_sql(text)
+                        .with_identifier_parameters(conversion.has_identifier_parameters),
+                );
+                stmts.extend(body);
+            }
+            Err(_) => unparsable.push(UnparsableStatement {
+                range: *r,
+                sql: text.to_owned(),
+            }),
+        }
+    }
+
+    // Typecheck rules use the test database's built-in catalog; user schemas are filtered out.
+    analyser.run(AnalyserParams {
+        stmts,
+        unparsable,
+        catalog_base: is_typecheck.then(typecheck_catalog),
+        search_path: vec!["public".into()],
+        typecheck: is_typecheck,
+        sections: migration_sections(query),
+        source: Some(query.to_owned()),
+        ..Default::default()
+    })
+}
+
+/// Applies all fixes, safe and unsafe, until none is left, like `check --fix --unsafe`. That must
+/// end: a fixed statement must not get the same fix again.
+fn assert_fixes_converge(analyser: &Analyser, query: &str, is_typecheck: bool) {
+    let mut code = query.to_string();
+    for _ in 0..10 {
+        let diagnostics = analyse(analyser, &code, is_typecheck);
+        let mut fixes: Vec<&RuleFix> = diagnostics
+            .iter()
+            .filter_map(LinterDiagnostic::get_fix)
+            .collect();
+        fixes.sort_by_key(|fix| fix.range().map(TextRange::start));
+        let mut combined = RuleFix::new("");
+        for fix in fixes {
+            let overlaps = combined
+                .range()
+                .zip(fix.range())
+                .is_some_and(|(previous, range)| range.start() <= previous.end());
+            if !overlaps {
+                combined.edits.extend(fix.edits.iter().cloned());
+            }
+        }
+        if combined.edits.is_empty() {
+            return;
+        }
+        code = combined.apply(&code);
+    }
+    panic!("the fixes still change the input after 10 passes:\n{code}");
+}
+
+/// The statements in the body of a SQL function, as the workspace extracts them.
+fn sql_function_body(
+    root: &pgls_query::NodeEnum,
+    sql: &str,
+    range: TextRange,
+) -> Vec<AnalysableStatement> {
+    let pgls_query::NodeEnum::CreateFunctionStmt(create_fn) = root else {
+        return Vec::new();
+    };
+    let function = pgls_catalog::resolve::FunctionContext::from_create_function(create_fn);
+    pgls_query_ext::function_body::sql_function_body(root, sql)
+        .iter()
+        .filter_map(|statement| {
+            let root = pgls_query::parse(&statement.sql).ok()?.into_root()?;
+            Some(
+                AnalysableStatement::embedded(root, range.start(), statement)
+                    .with_function(function.clone()),
+            )
+        })
+        .collect()
+}
+
+/// The migration sections of the file, each starting at a `-- section: up` or
+/// `-- section: down transaction:false` line. Like dbmate, each section is sent to Postgres as
+/// one query, unless `queries:separate` follows, like goose without `StatementBegin`.
+fn migration_sections(query: &str) -> Vec<MigrationSection> {
+    let mut sections: Vec<MigrationSection> = Vec::new();
+    let mut one_query = Vec::new();
+    let mut offset = 0;
+    for line in query.split_inclusive('\n') {
+        let start = TextSize::from(offset as u32);
+        offset += line.len();
+        let Some(section) = line.trim_end().strip_prefix("-- section:") else {
+            continue;
+        };
+        let mut words = section.split_whitespace();
+        let direction = match words.next() {
+            Some("up") => Direction::Up,
+            Some("down") => Direction::Down,
+            other => panic!("Unknown section direction `{other:?}`"),
+        };
+        let mut transaction = true;
+        let mut separate = false;
+        for option in words {
+            match option {
+                "transaction:false" => transaction = false,
+                "queries:separate" => separate = true,
+                other => panic!("Unknown section option `{other}`"),
+            }
+        }
+        if let Some(previous) = sections.last_mut() {
+            previous.range = TextRange::new(previous.range.start(), start);
+        }
+        sections.push(MigrationSection {
+            range: TextRange::new(start, TextSize::from(query.len() as u32)),
+            direction,
+            transaction,
+            queries: Vec::new(),
+        });
+        one_query.push(!separate);
+    }
+    for (section, one_query) in sections.iter_mut().zip(one_query) {
+        if one_query {
+            section.queries = vec![section.range];
+        }
+    }
+    sections
 }
 
 fn parse_test_path(path: &Path) -> (String, String, String) {
@@ -187,8 +300,37 @@ fn write_snapshot(snapshot: &mut String, query: &str, diagnostics: &[LinterDiagn
 
             writeln!(snapshot, "{}", StdDisplay(printer)).unwrap();
             writeln!(snapshot).unwrap();
+
+            if let Some(fix) = diagnostic.get_fix() {
+                write_fix(snapshot, query, fix);
+            }
         }
     }
+}
+
+/// Writes the input with the fix applied. A fix must keep the input valid SQL, with its
+/// placeholders read as parameters.
+fn write_fix(snapshot: &mut String, query: &str, fix: &RuleFix) {
+    let applicability = match fix.applicability {
+        Applicability::Always => "safe",
+        Applicability::MaybeIncorrect => "unsafe",
+    };
+    let fixed = fix.apply(query);
+    let parses =
+        |sql: &str| pgls_query::parse(&pgls_lexer::convert_to_positional_params(sql)).is_ok();
+    if parses(query) {
+        assert!(
+            parses(&fixed),
+            "the fix `{}` produces invalid SQL:\n{fixed}",
+            fix.message
+        );
+    }
+
+    writeln!(snapshot, "## Fix ({applicability}): {}", fix.message).unwrap();
+    writeln!(snapshot, "```").unwrap();
+    writeln!(snapshot, "{fixed}").unwrap();
+    writeln!(snapshot, "```").unwrap();
+    writeln!(snapshot).unwrap();
 }
 
 enum Expectation {

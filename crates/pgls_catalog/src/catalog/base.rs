@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Key, key};
 use crate::lookup::{
-    ColumnInfo, FunctionInfo, FunctionKind, Origin, RelationInfo, RelationKind, TypeInfo,
+    ColumnInfo, FunctionInfo, FunctionKind, IndexInfo, Origin, RelationInfo, RelationKind, TypeInfo,
 };
 
 /// Indexed, immutable view of a database snapshot. Build it once per snapshot and share it
@@ -24,6 +24,9 @@ pub struct CatalogBase {
     possible_relations: FxHashSet<Key>,
     /// Partitions and tables that inherit from another table.
     inheritance_children: FxHashSet<Key>,
+    indexes: FxHashMap<Key, IndexInfo>,
+    /// The indexes of each table, by the key of the table.
+    table_indexes: FxHashMap<Key, Vec<Key>>,
     types: FxHashMap<Key, TypeInfo>,
     functions: FxHashMap<Key, Vec<FunctionInfo>>,
     types_by_id: FxHashMap<i64, TypeInfo>,
@@ -181,12 +184,38 @@ impl CatalogBase {
                 });
         }
 
+        let mut indexes = FxHashMap::default();
+        let mut table_indexes: FxHashMap<Key, Vec<Key>> = FxHashMap::default();
+        for index in &snapshot.indexes {
+            let index_key = key(&index.schema, &index.name);
+            table_indexes
+                .entry(key(&index.schema, &index.table_name))
+                .or_default()
+                .push(index_key.clone());
+            indexes.insert(
+                index_key,
+                IndexInfo {
+                    schema: index.schema.clone(),
+                    name: index.name.clone(),
+                    table: index.table_name.clone(),
+                    origin: Origin::Database,
+                },
+            );
+        }
+
         let mut functions: FxHashMap<Key, Vec<FunctionInfo>> = FxHashMap::default();
         for function in &snapshot.functions {
             let args = &function.args.args;
+            // `CALL` passes the output arguments of procedures too (`FuncnameGetCandidates`
+            // with `include_out_arguments`):
+            // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/namespace.c#L1272
+            let is_procedure = function.kind == ProcKind::Procedure;
+            let is_call_argument = |mode: &str| {
+                matches!(mode, "in" | "inout" | "variadic") || (is_procedure && mode == "out")
+            };
             let inputs = args
                 .iter()
-                .filter(|arg| matches!(arg.mode.as_str(), "in" | "inout" | "variadic"))
+                .filter(|arg| is_call_argument(&arg.mode))
                 .count();
             // Defaults belong to the last input arguments. The snapshot doesn't attach them to
             // the right arguments when there are output arguments, but their number is correct.
@@ -235,6 +264,7 @@ impl CatalogBase {
                     max_args: (!variadic).then_some(inputs),
                     returns_set: function.is_set_returning_function,
                     return_columns,
+                    volatility: Some(function.behavior),
                     origin: Origin::Database,
 
                     signature: Some(FunctionSignature {
@@ -245,6 +275,7 @@ impl CatalogBase {
                                     "in" => FunctionArgumentMode::In,
                                     "inout" => FunctionArgumentMode::InOut,
                                     "variadic" => FunctionArgumentMode::Variadic,
+                                    "out" if is_procedure => FunctionArgumentMode::Out,
                                     _ => return None,
                                 };
                                 Some(FunctionArgument {
@@ -256,6 +287,26 @@ impl CatalogBase {
                                 })
                             })
                             .collect(),
+                        output_arguments: if is_procedure {
+                            Vec::new()
+                        } else {
+                            args.iter()
+                                .enumerate()
+                                .filter(|(_, arg)| matches!(arg.mode.as_str(), "out" | "table"))
+                                .map(|(position, arg)| {
+                                    (
+                                        position,
+                                        FunctionArgument {
+                                            name: (!arg.name.is_empty()).then(|| arg.name.clone()),
+                                            ty: types_by_id
+                                                .contains_key(&arg.type_id)
+                                                .then_some(TypeId::Snapshot(arg.type_id)),
+                                            mode: FunctionArgumentMode::Out,
+                                        },
+                                    )
+                                })
+                                .collect()
+                        },
                         input_defaults: defaults,
                         variadic_element: (function.variadic_type_id != 0
                             && types_by_id.contains_key(&function.variadic_type_id))
@@ -335,6 +386,8 @@ impl CatalogBase {
             relations,
             possible_relations,
             inheritance_children,
+            indexes,
+            table_indexes,
             types,
             functions,
             types_by_id,
@@ -382,6 +435,33 @@ impl CatalogBase {
 
     pub(super) fn may_have_relation(&self, schema: &str, name: &str) -> bool {
         self.possible_relations.contains(&key(schema, name))
+    }
+
+    pub(super) fn index(&self, schema: &str, name: &str) -> Option<&IndexInfo> {
+        self.indexes.get(&key(schema, name))
+    }
+
+    /// The indexes on a table.
+    pub(super) fn table_indexes(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> impl Iterator<Item = &IndexInfo> {
+        self.table_indexes
+            .get(&key(schema, table))
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.indexes.get(index))
+    }
+
+    /// Whether the snapshot may lack this index. The snapshot leaves out the indexes of the
+    /// system schemas, whose names in `pg_catalog` and `pg_toast` all start with `pg_`.
+    pub(super) fn may_have_index(&self, schema: &str, name: &str) -> bool {
+        match schema {
+            "pg_catalog" | "pg_toast" => name.starts_with("pg_"),
+            "information_schema" => true,
+            _ => false,
+        }
     }
 
     pub(super) fn type_(&self, schema: &str, name: &str) -> Option<&TypeInfo> {

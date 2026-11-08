@@ -10,6 +10,10 @@ env:
   # Need these guys for cross-compilation
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+  # jemalloc can't detect the page size when cross-compiling and assumes the build host's 4K
+  # pages, so the binary aborts on kernels with 16K or 64K pages (Asahi Linux, some ARM
+  # servers). 2^16 bytes supports all three.
+  AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE: "16"
 
 jobs:
   # windows does not run git cliff so we need to do it here
@@ -93,8 +97,8 @@ jobs:
         config:
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-22.04, target: aarch64-unknown-linux-gnu }
-          - { os: macos-14, target: x86_64-apple-darwin }
-          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-15, target: x86_64-apple-darwin }
+          - { os: macos-15, target: aarch64-apple-darwin }
           - { os: windows-2022, target: x86_64-pc-windows-msvc }
           - { os: windows-2022, target: aarch64-pc-windows-msvc }
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-musl }

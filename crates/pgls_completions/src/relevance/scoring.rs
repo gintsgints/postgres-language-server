@@ -2,7 +2,7 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
 use pgls_treesitter::context::{TreesitterContext, WrappingClause};
 
-use crate::sanitization;
+use crate::{providers::helper::word_at_cursor, sanitization};
 
 use super::CompletionRelevanceData;
 
@@ -52,8 +52,14 @@ impl CompletionScore<'_> {
     }
 
     fn check_matches_query_input(&mut self, ctx: &TreesitterContext) {
-        let content = match ctx.get_node_under_cursor_content() {
-            Some(c) if !sanitization::is_sanitized_token(c.as_str()) => c.replace('"', ""),
+        let content = match self.data {
+            CompletionRelevanceData::Keyword(_) => Some(ctx.text[word_at_cursor(ctx)].to_string()),
+            _ => ctx.get_node_under_cursor_content(),
+        };
+        let content = match content {
+            Some(c) if !sanitization::is_sanitized_token(c.as_str()) => {
+                sanitization::remove_sanitized_token(&c).replace('"', "")
+            }
             _ => {
                 return;
             }
@@ -76,7 +82,9 @@ impl CompletionScore<'_> {
             (Some(_), Some(_)) => name.clone(),
 
             // If only one qualifier is written out, we might look at a schema, a table, or an alias.
-            (None, Some(qualifier)) => {
+            (None, Some(_)) => {
+                let qualifier = ctx.tail_qualifier_sanitized().unwrap_or_default();
+                let qualifier = qualifier.as_str();
                 if self.get_schema_name().is_some_and(|s| s == qualifier) {
                     self.get_table_name()
                         .map(|t| format!("{t}.{name}"))
@@ -102,8 +110,9 @@ impl CompletionScore<'_> {
             _ => match self.data {
                 // for columns and functions, we fuzzy match with a possible alias.
                 CompletionRelevanceData::Column(_) | CompletionRelevanceData::Policy(_) => self
-                    .get_table_name()
-                    .and_then(|tbl| ctx.get_used_alias_for_table(tbl))
+                    .get_schema_name()
+                    .zip(self.get_table_name())
+                    .and_then(|(schema, tbl)| ctx.get_used_alias_for_table(schema, tbl))
                     .map(|t| format!("{t}.{name}"))
                     .unwrap_or(name.clone()),
 
@@ -156,6 +165,7 @@ impl CompletionScore<'_> {
             CompletionRelevanceData::Table(_) => match clause_type {
                 WrappingClause::Update => 10,
                 WrappingClause::Delete => 10,
+                WrappingClause::Merge => 10,
                 WrappingClause::From => 5,
                 WrappingClause::Join { on_node }
                     if on_node
@@ -169,6 +179,8 @@ impl CompletionScore<'_> {
                 WrappingClause::Select if !has_mentioned_tables => 15,
                 WrappingClause::Select if has_mentioned_tables => 0,
                 WrappingClause::From => 0,
+                WrappingClause::Returning => 0,
+                WrappingClause::Merge | WrappingClause::MergeWhen => 0,
                 WrappingClause::CheckOrUsingClause => 0,
                 _ => -50,
             },
@@ -176,6 +188,10 @@ impl CompletionScore<'_> {
                 WrappingClause::Select if has_mentioned_tables => 10,
                 WrappingClause::Select if !has_mentioned_tables => 0,
                 WrappingClause::Where => 10,
+                // RETURNING has the target table.
+                WrappingClause::Returning => 10,
+                // MERGE has the target and the source.
+                WrappingClause::Merge | WrappingClause::MergeWhen => 10,
                 WrappingClause::CheckOrUsingClause => 0,
                 WrappingClause::Join { on_node }
                     if on_node
@@ -191,6 +207,7 @@ impl CompletionScore<'_> {
                 WrappingClause::Join { .. } if !has_qualifier => 15,
                 WrappingClause::Update if !has_qualifier => 15,
                 WrappingClause::Delete if !has_qualifier => 15,
+                WrappingClause::Merge if !has_qualifier => 15,
                 WrappingClause::AlterPolicy if !has_qualifier => 15,
                 WrappingClause::DropPolicy if !has_qualifier => 15,
                 WrappingClause::CreatePolicy if !has_qualifier => 15,
@@ -443,7 +460,7 @@ impl CompletionScore<'_> {
                     set.iter().any(|mentioned| match mentioned.alias.as_ref() {
                         Some(als) => {
                             let aliased_table = ctx.get_mentioned_table_for_alias(als.as_str());
-                            column.name == mentioned.column.replace('"', "")
+                            column.name == mentioned.column
                                 && aliased_table.is_none_or(|t| t == &column.table_name)
                         }
                         None => mentioned.column == column.name,

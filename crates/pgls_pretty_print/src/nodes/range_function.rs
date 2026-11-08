@@ -3,7 +3,17 @@ use pgls_query::protobuf::RangeFunction;
 use crate::TokenKind;
 use crate::emitter::{EventEmitter, GroupKind, LineType};
 
-use super::node_list::emit_comma_separated_list;
+use super::node_list::{emit_comma_separated_list, emit_parenthesized_list};
+
+/// Emits a function of a `FROM` item. A cast there must keep the `CAST(...)` spelling.
+fn emit_function(e: &mut EventEmitter, node: &pgls_query::Node) {
+    match node.node.as_ref() {
+        Some(pgls_query::NodeEnum::TypeCast(type_cast)) => {
+            super::type_cast::emit_type_cast_call(e, type_cast)
+        }
+        _ => super::emit_node(node, e),
+    }
+}
 
 pub(super) fn emit_range_function(e: &mut EventEmitter, n: &RangeFunction) {
     e.group_start(GroupKind::RangeFunction);
@@ -25,7 +35,7 @@ pub(super) fn emit_range_function(e: &mut EventEmitter, n: &RangeFunction) {
             if let Some(pgls_query::NodeEnum::List(func_list)) = node.node.as_ref() {
                 if !func_list.items.is_empty() {
                     // Emit the function call (first item)
-                    super::emit_node(&func_list.items[0], e);
+                    emit_function(e, &func_list.items[0]);
 
                     // Emit column definitions if present (items after first)
                     // Check that there are actual non-empty column definitions
@@ -38,13 +48,11 @@ pub(super) fn emit_range_function(e: &mut EventEmitter, n: &RangeFunction) {
                         e.space();
                         e.token(TokenKind::AS_KW);
                         e.space();
-                        e.token(TokenKind::L_PAREN);
-                        emit_comma_separated_list(e, &col_defs, super::emit_node);
-                        e.token(TokenKind::R_PAREN);
+                        emit_parenthesized_list(e, &col_defs, super::emit_node);
                     }
                 }
             } else {
-                super::emit_node(node, e);
+                emit_function(e, node);
             }
         });
 
@@ -55,10 +63,10 @@ pub(super) fn emit_range_function(e: &mut EventEmitter, n: &RangeFunction) {
             // For non-ROWS FROM, functions[0] is the List containing the function
             if let Some(pgls_query::NodeEnum::List(func_list)) = n.functions[0].node.as_ref() {
                 if !func_list.items.is_empty() {
-                    super::emit_node(&func_list.items[0], e);
+                    emit_function(e, &func_list.items[0]);
                 }
             } else {
-                super::emit_node(&n.functions[0], e);
+                emit_function(e, &n.functions[0]);
             }
         }
     }

@@ -5,7 +5,7 @@
 import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
 
 import { type LanguageServer, createLanguageServer } from "../src/lsp";
-import { type Workspace, createWorkspace } from "../src/workspace";
+import { type FormatOptions, type Workspace, createWorkspace, format } from "../src/workspace";
 
 // =============================================================================
 // Workspace API Tests
@@ -281,6 +281,49 @@ alter table deal_type add column key text not null;
 });
 
 // =============================================================================
+// Format Tests
+// =============================================================================
+
+describe("Format", () => {
+  const sql = 'CREATE TABLE "public"."t" ("id" "uuid" NOT NULL)';
+  let workspace: Workspace;
+
+  beforeAll(async () => {
+    workspace = await createWorkspace();
+  });
+
+  test("formatSql uses defaults", () => {
+    const result = workspace.formatSql(sql);
+    expect(result.formatted).toBe("create table public.t (id uuid not null);");
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  test("formatSql applies options", () => {
+    const result = workspace.formatSql(sql, { keywordCase: "upper" });
+    expect(result.formatted).toBe("CREATE TABLE public.t (id uuid NOT NULL);");
+  });
+
+  test("format formats a workspace file and reports unformattable statements", () => {
+    workspace.insertFile("/format.sql", "select 1;\n\nSELEC 2;\n");
+    const result = workspace.format("/format.sql", { keywordCase: "upper" });
+    expect(result.formatted).toBe("SELECT 1;\n\nSELEC 2;\n");
+    expect(result.diagnostics.length).toBe(1);
+  });
+
+  test("format throws on invalid options", () => {
+    expect(() =>
+      workspace.formatSql(sql, { keywordCase: "shout" } as unknown as FormatOptions),
+    ).toThrow();
+  });
+
+  test("top-level format returns the formatted string", async () => {
+    expect(await format(sql, { keywordCase: "upper" })).toBe(
+      "CREATE TABLE public.t (id uuid NOT NULL);",
+    );
+  });
+});
+
+// =============================================================================
 // Language Server API Tests
 // =============================================================================
 
@@ -386,6 +429,40 @@ describe("LanguageServer API", () => {
     expect(notification).toBeDefined();
     // @ts-expect-error - params is unknown type
     expect(notification?.params?.diagnostics?.length).toBeGreaterThan(0);
+  });
+
+  test("codeAction returns the fixes and suppressions at the cursor", () => {
+    lsp.handleMessage({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: "file:///code-action.sql",
+          languageId: "sql",
+          version: 1,
+          text: "refresh materialized view user_stats;",
+        },
+      },
+    });
+
+    const messages = lsp.handleMessage({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "textDocument/codeAction",
+      params: {
+        textDocument: { uri: "file:///code-action.sql" },
+        range: { start: { line: 0, character: 2 }, end: { line: 0, character: 2 } },
+        context: { diagnostics: [] },
+      },
+    });
+
+    expect(messages.length).toBe(1);
+    // @ts-expect-error - result is unknown type
+    const titles = messages[0].result.map((action) => action.title);
+    expect(titles).toEqual([
+      "Add CONCURRENTLY",
+      "Suppress rule requireConcurrentRefreshMatview for this statement",
+    ]);
   });
 
   test("unknown method returns error", () => {

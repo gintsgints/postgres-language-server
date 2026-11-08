@@ -1,5 +1,5 @@
 use crate::TokenKind;
-use crate::emitter::{GroupKind, LayoutEvent, LineType};
+use crate::emitter::{LayoutEvent, LineType};
 use std::fmt::Write;
 
 #[derive(Debug, Clone)]
@@ -44,12 +44,24 @@ impl Default for RenderConfig {
     }
 }
 
+/// The column continuation lines align with, from `AlignStart`.
+struct Alignment {
+    column: usize,
+    /// The indent level when the alignment started.
+    indent_level: usize,
+}
+
 pub struct Renderer<W: Write> {
     config: RenderConfig,
     writer: W,
     current_line_length: usize,
     indent_level: usize,
+    /// Open alignments, innermost last.
+    alignments: Vec<Alignment>,
     at_line_start: bool,
+    /// A space written after the last text. It is only written out once more text follows on the
+    /// same line, so a line never ends in whitespace.
+    pending_space: bool,
 }
 
 impl<W: Write> Renderer<W> {
@@ -59,7 +71,9 @@ impl<W: Write> Renderer<W> {
             writer,
             current_line_length: 0,
             indent_level: 0,
+            alignments: Vec::new(),
             at_line_start: true,
+            pending_space: false,
         }
     }
 
@@ -90,8 +104,8 @@ impl<W: Write> Renderer<W> {
                 }
                 LayoutEvent::GroupStart { .. } => {
                     let group_end = self.find_group_end(events, i);
-                    let group_slice = &events[i..=group_end];
-                    self.render_group(group_slice)?;
+                    let trailing_width = self.trailing_width(&events[group_end + 1..], 0);
+                    self.render_group(&events[i..=group_end], trailing_width)?;
                     i = group_end + 1;
                 }
                 LayoutEvent::GroupEnd => {
@@ -105,42 +119,66 @@ impl<W: Write> Renderer<W> {
                     self.indent_level = self.indent_level.saturating_sub(1);
                     i += 1;
                 }
+                LayoutEvent::AlignStart => {
+                    self.start_alignment();
+                    i += 1;
+                }
+                LayoutEvent::AlignEnd => {
+                    self.alignments.pop();
+                    i += 1;
+                }
             }
         }
         Ok(())
     }
 
-    fn render_group(&mut self, group_events: &[LayoutEvent]) -> Result<(), std::fmt::Error> {
-        if let Some(single_line) = self.try_single_line(group_events) {
-            let would_fit =
-                self.effective_line_length() + single_line.len() <= self.config.max_line_length;
-            if would_fit {
-                self.write_text(&single_line)?;
-                return Ok(());
+    /// Renders a group on one line when it fits, `trailing_width` included, and breaks it
+    /// otherwise. A nested group decides on its own, whether or not its parent broke.
+    fn render_group(
+        &mut self,
+        group_events: &[LayoutEvent],
+        trailing_width: usize,
+    ) -> Result<(), std::fmt::Error> {
+        if let Some(single_line) = self.single_line_if_fits(group_events, trailing_width) {
+            // A space that ends the group waits for the next text, like any other space.
+            let text = single_line.trim_end_matches(' ');
+            if !text.is_empty() {
+                self.write_text(text)?;
             }
+            if text.len() < single_line.len() {
+                self.write_space()?;
+            }
+            return Ok(());
         }
 
-        self.render_events_with_breaks(group_events)
+        // Skip the GroupStart and GroupEnd markers.
+        self.render_events_with_breaks(&group_events[1..group_events.len() - 1], trailing_width)
     }
 
-    /// Render an inner group, allowing it to try single-line independently of parent's break status.
-    /// This enables nested groups to stay compact even when the parent group is breaking.
-    fn render_inner_group(&mut self, group_events: &[LayoutEvent]) -> Result<(), std::fmt::Error> {
-        // Extract inner events (skip GroupStart and GroupEnd markers)
-        let inner_events = &group_events[1..group_events.len() - 1];
-
-        // Try single-line first, independent of parent's break status
-        if let Some(single_line) = self.try_single_line(group_events) {
-            let would_fit =
-                self.effective_line_length() + single_line.len() <= self.config.max_line_length;
-            if would_fit {
-                self.write_text(&single_line)?;
-                return Ok(());
+    /// The width of the text that follows a group without a break opportunity in between, such as
+    /// the comma after a list item. `outer_trailing_width` is what follows the enclosing events.
+    fn trailing_width(&self, events: &[LayoutEvent], outer_trailing_width: usize) -> usize {
+        let mut width = 0;
+        for event in events {
+            match event {
+                LayoutEvent::Token(token) => {
+                    let text = token.render(&self.config);
+                    match text.split_once('\n') {
+                        Some((first_line, _)) => return width + first_line.len(),
+                        None => width += text.len(),
+                    }
+                }
+                LayoutEvent::Space => width += 1,
+                LayoutEvent::GroupStart { .. }
+                | LayoutEvent::GroupEnd
+                | LayoutEvent::IndentStart
+                | LayoutEvent::IndentEnd
+                | LayoutEvent::AlignStart
+                | LayoutEvent::AlignEnd => {}
+                LayoutEvent::Line(_) | LayoutEvent::Comment { .. } => return width,
             }
         }
-
-        // Fall back to breaking
-        self.render_events_with_breaks(inner_events)
+        width + outer_trailing_width
     }
 
     /// The current line length, counting the indentation that will be written when the
@@ -149,20 +187,45 @@ impl<W: Write> Renderer<W> {
     /// made right after a break must account for the pending indentation themselves.
     fn effective_line_length(&self) -> usize {
         if self.at_line_start {
-            self.indent_level * self.config.indent_size
+            self.indentation_width()
         } else {
             self.current_line_length
         }
     }
 
-    fn render_events_with_breaks(&mut self, events: &[LayoutEvent]) -> Result<(), std::fmt::Error> {
+    /// Continuation lines start at the column of the innermost alignment, plus one indent for
+    /// every level opened since. Without an alignment they start at the indent level.
+    fn indentation_width(&self) -> usize {
+        let indent = self.indent_level * self.config.indent_size;
+        match self.alignments.last() {
+            Some(alignment) => (alignment.column + indent)
+                .saturating_sub(alignment.indent_level * self.config.indent_size),
+            None => indent,
+        }
+    }
+
+    /// The column is kept with the indent level it was taken at, not as an offset from that
+    /// level's indent: the text on the line can start left of it, `select case` with the select
+    /// list already one level in for instance.
+    fn start_alignment(&mut self) {
+        self.alignments.push(Alignment {
+            column: self.effective_line_length(),
+            indent_level: self.indent_level,
+        });
+    }
+
+    fn render_events_with_breaks(
+        &mut self,
+        events: &[LayoutEvent],
+        trailing_width: usize,
+    ) -> Result<(), std::fmt::Error> {
         let mut i = 0;
         while i < events.len() {
             match &events[i] {
                 LayoutEvent::Token(token) => {
                     // This path is only taken when the enclosing group broke, so the statement
                     // already spans several lines and the terminator can stand alone. A statement
-                    // that fits is rendered by try_single_line, which never reaches this code, and
+                    // that fits is rendered by single_line_if_fits, which never reaches this code, and
                     // therefore keeps its semicolon attached.
                     if self.config.isolate_semicolon && matches!(token, TokenKind::SEMICOLON) {
                         self.write_line_break()?;
@@ -178,10 +241,13 @@ impl<W: Write> Renderer<W> {
                 }
                 LayoutEvent::Line(line_type) => {
                     match line_type {
-                        LineType::Fill if self.next_fill_item_fits(events, i + 1, 1) => {
+                        LineType::Fill
+                            if self.next_fill_item_fits(events, i + 1, 1, trailing_width) =>
+                        {
                             self.write_space()?;
                         }
-                        LineType::FillNoSpace if self.next_fill_item_fits(events, i + 1, 0) => {}
+                        LineType::FillNoSpace
+                            if self.next_fill_item_fits(events, i + 1, 0, trailing_width) => {}
                         _ => self.write_line_break()?,
                     }
                     i += 1;
@@ -190,39 +256,11 @@ impl<W: Write> Renderer<W> {
                     self.write_text(text)?;
                     i += 1;
                 }
-                LayoutEvent::GroupStart { kind } => {
+                LayoutEvent::GroupStart { .. } => {
                     let group_end = self.find_group_end(events, i);
-                    let group_slice = &events[i..=group_end];
-
-                    // Decide whether to try single-line for this nested group.
-                    // We try single-line in two cases:
-                    // 1. Followed by a Hard break (semantic boundary like RETURNS after
-                    //    function signature)
-                    // 2. The group's single-line form is small enough to fit on its own
-                    //    (allows compact column lists, function args, etc.)
-                    let followed_by_hard_break = events
-                        .get(group_end + 1)
-                        .is_some_and(|e| matches!(e, LayoutEvent::Line(LineType::Hard)));
-
-                    let try_single_line = if matches!(kind, GroupKind::FunctionArgumentGroup)
-                        || followed_by_hard_break
-                    {
-                        true
-                    } else if let Some(single_line) = self.try_single_line(group_slice) {
-                        // Allow small groups to stay on one line even without Hard break
-                        // This keeps column lists, function args compact
-                        single_line.len() <= self.config.max_line_length / 2
-                    } else {
-                        false
-                    };
-
-                    if try_single_line {
-                        self.render_inner_group(group_slice)?;
-                    } else {
-                        // Force nested group to break
-                        let inner_events = &events[i + 1..group_end];
-                        self.render_events_with_breaks(inner_events)?;
-                    }
+                    let group_trailing_width =
+                        self.trailing_width(&events[group_end + 1..], trailing_width);
+                    self.render_group(&events[i..=group_end], group_trailing_width)?;
                     i = group_end + 1;
                 }
                 LayoutEvent::GroupEnd => {
@@ -236,57 +274,83 @@ impl<W: Write> Renderer<W> {
                     self.indent_level = self.indent_level.saturating_sub(1);
                     i += 1;
                 }
+                LayoutEvent::AlignStart => {
+                    self.start_alignment();
+                    i += 1;
+                }
+                LayoutEvent::AlignEnd => {
+                    self.alignments.pop();
+                    i += 1;
+                }
             }
         }
         Ok(())
     }
 
-    fn try_single_line(&self, group_events: &[LayoutEvent]) -> Option<String> {
+    /// The group on one line, if it can be collapsed and fits on the current line followed by
+    /// `trailing_width` columns that cannot move to the next line. Only the first line of a text
+    /// spanning several lines, a function body for instance, sits on the current one, and what
+    /// follows the text has to fit on its last line.
+    ///
+    /// Measuring stops as soon as the line is full, so a large group that cannot fit is not
+    /// rendered in full for every level it is nested in.
+    fn single_line_if_fits(
+        &self,
+        group_events: &[LayoutEvent],
+        trailing_width: usize,
+    ) -> Option<String> {
+        let mut available = self
+            .config
+            .max_line_length
+            .saturating_sub(self.effective_line_length());
         let mut buffer = String::new();
-        let mut has_hard_breaks = false;
+        // Where the line being measured starts in `buffer`. After a text spanning several lines,
+        // that is its last line, which starts at the left margin; the lines in between are the
+        // text's own.
+        let mut line_start = 0;
 
         for event in group_events {
             match event {
-                LayoutEvent::Token(token) => {
-                    let text = token.render(&self.config);
-                    buffer.push_str(&text);
+                LayoutEvent::Token(token) => buffer.push_str(&token.render(&self.config)),
+                // Two spaces in a row collapse, as in `write_space`.
+                LayoutEvent::Space
+                | LayoutEvent::Line(LineType::SoftOrSpace)
+                | LayoutEvent::Line(LineType::Fill) => {
+                    if !buffer.ends_with(' ') {
+                        buffer.push(' ');
+                    }
                 }
-                LayoutEvent::Space => {
-                    buffer.push(' ');
-                }
-                LayoutEvent::Line(LineType::Hard) => {
-                    has_hard_breaks = true;
-                    break;
-                }
-                LayoutEvent::Line(LineType::Soft) => {
-                    // soft lines disappear in single-line mode (no space)
-                }
-                LayoutEvent::Line(LineType::SoftOrSpace) => {
-                    buffer.push(' '); // Becomes space in single-line mode
-                }
-                LayoutEvent::Line(LineType::Fill) => {
-                    buffer.push(' ');
-                }
-                LayoutEvent::Line(LineType::FillNoSpace) => {}
+                // Collapsing would push code behind a `--` comment or flatten a multi-line block
+                // comment into the surrounding expression.
+                LayoutEvent::Line(LineType::Hard) => return None,
                 LayoutEvent::Comment { text, line_comment } => {
                     if *line_comment || text.contains('\n') {
-                        // Collapsing would push code behind a `--` comment or flatten a
-                        // multi-line block comment into the surrounding expression.
-                        has_hard_breaks = true;
-                        break;
+                        return None;
                     }
                     buffer.push_str(text);
                 }
-                LayoutEvent::GroupStart { .. } | LayoutEvent::GroupEnd => {
-                    // skip group markers for single line test
+                LayoutEvent::Line(LineType::Soft | LineType::FillNoSpace)
+                | LayoutEvent::GroupStart { .. }
+                | LayoutEvent::GroupEnd
+                | LayoutEvent::IndentStart
+                | LayoutEvent::IndentEnd
+                | LayoutEvent::AlignStart
+                | LayoutEvent::AlignEnd => {}
+            }
+
+            if let Some(last_break) = buffer[line_start..].rfind('\n') {
+                if line_start == 0 && buffer.find('\n').is_some_and(|first| first > available) {
+                    return None;
                 }
-                LayoutEvent::IndentStart | LayoutEvent::IndentEnd => {
-                    // skip indent changes for single line test
-                }
+                line_start += last_break + 1;
+                available = self.config.max_line_length;
+            }
+            if buffer.len() - line_start + trailing_width > available {
+                return None;
             }
         }
 
-        if has_hard_breaks { None } else { Some(buffer) }
+        Some(buffer)
     }
 
     fn handle_line(&mut self, line_type: &LineType) -> Result<(), std::fmt::Error> {
@@ -303,20 +367,28 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Whether the next item of a fill list fits on the current line. The last item is followed by
+    /// `trailing_width`, the text after the list that cannot move to the next line, such as the
+    /// semicolon closing the statement.
     fn next_fill_item_fits(
         &self,
         events: &[LayoutEvent],
         start: usize,
         separator_width: usize,
+        trailing_width: usize,
     ) -> bool {
-        let Some(item_length) = self.next_fill_item_length(events, start) else {
+        let Some((item_length, is_last)) = self.next_fill_item_length(events, start) else {
             return false;
         };
+        let trailing_width = if is_last { trailing_width } else { 0 };
 
-        self.current_line_length + separator_width + item_length <= self.config.max_line_length
+        self.current_line_length + separator_width + item_length + trailing_width
+            <= self.config.max_line_length
     }
 
-    fn next_fill_item_length(&self, events: &[LayoutEvent], start: usize) -> Option<usize> {
+    /// The length of the fill item starting at `start`, and whether it runs to the end of
+    /// `events`, which makes it the last item.
+    fn next_fill_item_length(&self, events: &[LayoutEvent], start: usize) -> Option<(usize, bool)> {
         let mut length = 0;
         let mut depth = 0;
 
@@ -329,7 +401,9 @@ impl<W: Write> Renderer<W> {
                 LayoutEvent::Line(LineType::Hard) => return None,
                 LayoutEvent::Line(LineType::Soft) => {}
                 LayoutEvent::Line(LineType::SoftOrSpace) => length += 1,
-                LayoutEvent::Line(LineType::Fill | LineType::FillNoSpace) if depth == 0 => break,
+                LayoutEvent::Line(LineType::Fill | LineType::FillNoSpace) if depth == 0 => {
+                    return Some((length, false));
+                }
                 LayoutEvent::Line(LineType::Fill) => length += 1,
                 LayoutEvent::Line(LineType::FillNoSpace) => {}
                 LayoutEvent::Comment { text, line_comment } => {
@@ -339,13 +413,16 @@ impl<W: Write> Renderer<W> {
                     length += text.len();
                 }
                 LayoutEvent::GroupStart { .. } => depth += 1,
-                LayoutEvent::GroupEnd if depth == 0 => break,
+                LayoutEvent::GroupEnd if depth == 0 => return Some((length, false)),
                 LayoutEvent::GroupEnd => depth -= 1,
-                LayoutEvent::IndentStart | LayoutEvent::IndentEnd => {}
+                LayoutEvent::IndentStart
+                | LayoutEvent::IndentEnd
+                | LayoutEvent::AlignStart
+                | LayoutEvent::AlignEnd => {}
             }
         }
 
-        Some(length)
+        Some((length, true))
     }
 
     fn find_group_end(&self, events: &[LayoutEvent], start: usize) -> usize {
@@ -369,6 +446,8 @@ impl<W: Write> Renderer<W> {
         if self.at_line_start {
             self.write_indentation()?;
             self.at_line_start = false;
+        } else if std::mem::take(&mut self.pending_space) {
+            write!(self.writer, " ")?;
         }
 
         write!(self.writer, "{text}")?;
@@ -381,15 +460,23 @@ impl<W: Write> Renderer<W> {
         Ok(())
     }
 
+    /// Two spaces in a row, from a space next to a line that stayed flat for instance, are
+    /// written as one.
     fn write_space(&mut self) -> Result<(), std::fmt::Error> {
-        if !self.at_line_start {
-            write!(self.writer, " ")?;
+        if !self.at_line_start && !self.pending_space {
+            self.pending_space = true;
             self.current_line_length += 1;
         }
         Ok(())
     }
 
+    /// Ends the current line. A line that has no text yet is not ended again: two breaks in a
+    /// row, around an empty list for instance, would otherwise print a blank line.
     fn write_line_break(&mut self) -> Result<(), std::fmt::Error> {
+        self.pending_space = false;
+        if self.at_line_start {
+            return Ok(());
+        }
         writeln!(self.writer)?;
         self.current_line_length = 0;
         self.at_line_start = true;
@@ -399,14 +486,21 @@ impl<W: Write> Renderer<W> {
     fn write_indentation(&mut self) -> Result<(), std::fmt::Error> {
         let indent_str = match self.config.indent_style {
             IndentStyle::Spaces => {
-                let spaces = " ".repeat(self.indent_level * self.config.indent_size);
+                let spaces = " ".repeat(self.indentation_width());
                 self.current_line_length += spaces.len();
                 spaces
             }
+            // One tab per indent level and spaces for the rest of an alignment. The columns only
+            // line up when the editor's tab width equals `indent_size`.
             IndentStyle::Tabs => {
-                let tabs = "\t".repeat(self.indent_level);
-                self.current_line_length += self.indent_level * self.config.indent_size; // Approximate
-                tabs
+                let width = self.indentation_width();
+                let tabs = match self.config.indent_size {
+                    0 => self.indent_level,
+                    size => self.indent_level.min(width / size),
+                };
+                let spaces = width - tabs * self.config.indent_size;
+                self.current_line_length += width;
+                "\t".repeat(tabs) + &" ".repeat(spaces)
             }
         };
         write!(self.writer, "{indent_str}")?;

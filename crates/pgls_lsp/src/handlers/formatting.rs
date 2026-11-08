@@ -1,9 +1,12 @@
+use pgls_line_index::LineIndex;
 use pgls_text_edit::TextEdit as PglsTextEdit;
 use pgls_workspace::features::format::{PullFileFormattingParams, PullFormattingResult};
-use tower_lsp::lsp_types::{DocumentFormattingParams, DocumentRangeFormattingParams, TextEdit};
+use tower_lsp_server::ls_types::{
+    DocumentFormattingParams, DocumentRangeFormattingParams, TextEdit,
+};
 
 use crate::{
-    adapters::{PositionEncoding, from_lsp, line_index::LineIndex, to_lsp},
+    adapters::{PositionEncoding, from_lsp, to_lsp},
     diagnostics::LspError,
     session::Session,
 };
@@ -14,10 +17,15 @@ pub fn formatting(
 ) -> Result<Option<Vec<TextEdit>>, LspError> {
     let url = params.text_document.uri;
     let path = session.file_path(&url)?;
+    let project_key = session.project_key(&path);
 
     let result = session
         .workspace
-        .pull_file_formatting(PullFileFormattingParams { path, range: None })?;
+        .pull_file_formatting(PullFileFormattingParams {
+            project_key,
+            path,
+            range: None,
+        })?;
 
     result_to_edits(result, session.position_encoding())
 }
@@ -28,12 +36,14 @@ pub fn range_formatting(
 ) -> Result<Option<Vec<TextEdit>>, LspError> {
     let url = params.text_document.uri;
     let path = session.file_path(&url)?;
+    let project_key = session.project_key(&path);
     let doc = session.document(&url)?;
     let range = from_lsp::text_range(&doc.line_index, params.range, session.position_encoding())?;
 
     let result = session
         .workspace
         .pull_file_formatting(PullFileFormattingParams {
+            project_key,
             path,
             range: Some(range),
         })?;

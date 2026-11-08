@@ -1,12 +1,14 @@
-use crate::adapters::{PositionEncoding, WideEncoding, negotiated_encoding};
+use crate::adapters::{PositionEncoding, negotiated_encoding};
 use crate::handlers::code_actions::command_id;
+use pgls_line_index::WideEncoding;
 use pgls_workspace::features::code_actions::CommandActionCategory;
 use strum::IntoEnumIterator;
-use tower_lsp::lsp_types::{
-    ClientCapabilities, CompletionOptions, ExecuteCommandOptions, HoverProviderCapability, OneOf,
-    PositionEncodingKind, SaveOptions, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    WorkDoneProgressOptions,
+use tower_lsp_server::ls_types::{
+    ClientCapabilities, CompletionOptions, ExecuteCommandOptions, HoverProviderCapability,
+    InlayHintServerCapabilities, OneOf, PositionEncodingKind, SaveOptions,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
 };
 
 /// The capabilities to send from server as part of [`InitializeResult`]
@@ -64,11 +66,22 @@ pub(crate) fn server_capabilities(capabilities: &ClientCapabilities) -> ServerCa
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         document_on_type_formatting_provider: None,
-        code_action_provider: Some(tower_lsp::lsp_types::CodeActionProviderCapability::Simple(
-            true,
-        )),
+        code_action_provider: Some(
+            tower_lsp_server::ls_types::CodeActionProviderCapability::Simple(true),
+        ),
         rename_provider: None,
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            Default::default(),
+        ))),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: crate::handlers::semantic_tokens::legend(),
+                range: Some(true),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     }
 }

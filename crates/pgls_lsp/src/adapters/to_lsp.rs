@@ -1,29 +1,36 @@
-use crate::adapters::PositionEncoding;
-use crate::adapters::line_index::LineIndex;
+use crate::adapters::{PositionEncoding, from_lsp};
 use anyhow::{Context, Result};
+use pgls_line_index::LineIndex;
 use pgls_text_edit::{CompressedOp, DiffOp, TextEdit};
 use pgls_text_size::{TextRange, TextSize};
-use tower_lsp::lsp_types;
+use tower_lsp_server::ls_types;
 
 /// The function is used to convert TextSize to a LSP position.
 pub fn position(
     line_index: &LineIndex,
     offset: TextSize,
     position_encoding: PositionEncoding,
-) -> Result<lsp_types::Position> {
+) -> Result<ls_types::Position> {
     let line_col = line_index
         .line_col(offset)
         .with_context(|| format!("could not convert offset {offset:?} into a line-column index"))?;
 
     let position = match position_encoding {
-        PositionEncoding::Utf8 => lsp_types::Position::new(line_col.line, line_col.col),
+        PositionEncoding::Utf8 => ls_types::Position::new(line_col.line, line_col.col),
         PositionEncoding::Wide(enc) => {
             let line_col = line_index
                 .to_wide(enc, line_col)
                 .with_context(|| format!("could not convert {line_col:?} into wide line column"))?;
-            lsp_types::Position::new(line_col.line, line_col.col)
+            ls_types::Position::new(line_col.line, line_col.col)
         }
     };
+    // An offset between the `\r` and the `\n` of a line break is the end of its line, so the
+    // position maps back to the offset of `line_col`, not always to `offset`.
+    debug_assert_eq!(
+        from_lsp::offset(line_index, position, position_encoding).ok(),
+        line_index.offset(line_col),
+        "{position:?} doesn't map back to offset {offset:?}"
+    );
 
     Ok(position)
 }
@@ -33,10 +40,10 @@ pub fn range(
     line_index: &LineIndex,
     range: TextRange,
     position_encoding: PositionEncoding,
-) -> Result<lsp_types::Range> {
+) -> Result<ls_types::Range> {
     let start = position(line_index, range.start(), position_encoding)?;
     let end = position(line_index, range.end(), position_encoding)?;
-    Ok(lsp_types::Range::new(start, end))
+    Ok(ls_types::Range::new(start, end))
 }
 
 /// Convert a TextEdit diff to a list of LSP TextEdits.
@@ -44,7 +51,7 @@ pub fn text_edits(
     diff: &TextEdit,
     line_index: &LineIndex,
     encoding: PositionEncoding,
-) -> Result<Vec<lsp_types::TextEdit>> {
+) -> Result<Vec<ls_types::TextEdit>> {
     let mut result = Vec::new();
     let mut offset = TextSize::from(0u32);
 
@@ -55,15 +62,15 @@ pub fn text_edits(
             }
             CompressedOp::DiffOp(DiffOp::Insert { range }) => {
                 let start = position(line_index, offset, encoding)?;
-                let last = result.last_mut().filter(|e: &&mut lsp_types::TextEdit| {
+                let last = result.last_mut().filter(|e: &&mut ls_types::TextEdit| {
                     e.range.end == start && e.new_text.is_empty()
                 });
 
                 if let Some(last_edit) = last {
                     last_edit.new_text = diff.get_text(*range).to_string();
                 } else {
-                    result.push(lsp_types::TextEdit {
-                        range: lsp_types::Range::new(start, start),
+                    result.push(ls_types::TextEdit {
+                        range: ls_types::Range::new(start, start),
                         new_text: diff.get_text(*range).to_string(),
                     });
                 }
@@ -73,8 +80,8 @@ pub fn text_edits(
                 offset += range.len();
                 let end = position(line_index, offset, encoding)?;
 
-                result.push(lsp_types::TextEdit {
-                    range: lsp_types::Range::new(start, end),
+                result.push(ls_types::TextEdit {
+                    range: ls_types::Range::new(start, end),
                     new_text: String::new(),
                 });
             }
@@ -90,6 +97,133 @@ pub fn text_edits(
             }
         }
     }
+    debug_assert_eq!(
+        offset,
+        line_index.len(),
+        "the diff doesn't cover the whole text"
+    );
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use pgls_line_index::LineIndex;
+    use pgls_text_edit::TextEdit;
+    use tower_lsp_server::ls_types as lsp;
+
+    use super::text_edits;
+    use crate::adapters::PositionEncoding;
+
+    #[test]
+    fn test_diff_1() {
+        const OLD: &str = "line 1 old
+line 2
+line 3
+line 4
+line 5
+line 6
+line 7 old";
+
+        const NEW: &str = "line 1 new
+line 2
+line 3
+line 4
+line 5
+line 6
+line 7 new";
+
+        let line_index = LineIndex::new(OLD);
+        let diff = TextEdit::from_unicode_words(OLD, NEW);
+
+        let text_edit = text_edits(&diff, &line_index, PositionEncoding::Utf8).unwrap();
+
+        assert_eq!(
+            text_edit.as_slice(),
+            &[
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position {
+                            line: 0,
+                            character: 7,
+                        },
+                        end: lsp::Position {
+                            line: 0,
+                            character: 10,
+                        },
+                    },
+                    new_text: String::from("new"),
+                },
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position {
+                            line: 6,
+                            character: 7
+                        },
+                        end: lsp::Position {
+                            line: 6,
+                            character: 10
+                        }
+                    },
+                    new_text: String::from("new"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_diff_2() {
+        const OLD: &str = "console.log(\"Variable: \" + variable);";
+        const NEW: &str = "console.log(`Variable: ${variable}`);";
+
+        let line_index = LineIndex::new(OLD);
+        let diff = TextEdit::from_unicode_words(OLD, NEW);
+
+        let text_edit = text_edits(&diff, &line_index, PositionEncoding::Utf8).unwrap();
+
+        assert_eq!(
+            text_edit.as_slice(),
+            &[
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position {
+                            line: 0,
+                            character: 12,
+                        },
+                        end: lsp::Position {
+                            line: 0,
+                            character: 13,
+                        },
+                    },
+                    new_text: String::from("`"),
+                },
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position {
+                            line: 0,
+                            character: 23
+                        },
+                        end: lsp::Position {
+                            line: 0,
+                            character: 27
+                        }
+                    },
+                    new_text: String::from("${"),
+                },
+                lsp::TextEdit {
+                    range: lsp::Range {
+                        start: lsp::Position {
+                            line: 0,
+                            character: 35
+                        },
+                        end: lsp::Position {
+                            line: 0,
+                            character: 35
+                        }
+                    },
+                    new_text: String::from("}`"),
+                },
+            ]
+        );
+    }
 }

@@ -3,10 +3,9 @@ use pgls_query::{NodeEnum, protobuf::GrantRoleStmt};
 use crate::{
     TokenKind,
     emitter::{EventEmitter, GroupKind, LineType},
-    nodes::node_list::emit_comma_separated_list,
 };
 
-use super::def_elem::emit_grant_role_option;
+use super::{def_elem::emit_grant_role_option, grant_stmt::emit_grant_list};
 
 pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
     e.group_start(GroupKind::GrantRoleStmt);
@@ -22,14 +21,8 @@ pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
         for opt in &n.opt {
             if let Some(NodeEnum::DefElem(def)) = opt.node.as_ref() {
                 e.space();
-                // Emit the option name as uppercase
-                let opt_name = match def.defname.as_str() {
-                    "admin" => "ADMIN",
-                    "inherit" => "INHERIT",
-                    "set" => "SET",
-                    _ => &def.defname.to_uppercase(),
-                };
-                e.token(TokenKind::IDENT(opt_name.to_string()));
+                // Emit the option name
+                super::emit_keyword(e, &def.defname);
                 e.space();
                 e.token(TokenKind::OPTION_KW);
                 e.space();
@@ -41,10 +34,16 @@ pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
     // Role list
     if !n.granted_roles.is_empty() {
         e.space();
-        emit_comma_separated_list(e, &n.granted_roles, super::emit_node);
+        emit_grant_list(e, &n.granted_roles, super::emit_node);
     }
 
+    // The clauses after the granted roles continue the statement, so a broken one indents them.
+    e.indent_start();
+
     // TO or FROM
+    if let Some(grantee) = n.grantee_roles.first() {
+        super::emit_comments_before_keyword(e, if n.is_grant { "to" } else { "from" }, grantee);
+    }
     if n.is_grant {
         e.line(LineType::SoftOrSpace);
         e.token(TokenKind::TO_KW);
@@ -56,7 +55,7 @@ pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
     // Grantee list
     if !n.grantee_roles.is_empty() {
         e.space();
-        emit_comma_separated_list(e, &n.grantee_roles, super::emit_node);
+        emit_grant_list(e, &n.grantee_roles, super::emit_node);
     }
 
     // WITH options (WITH INHERIT TRUE, SET FALSE, etc.) - only for GRANT
@@ -64,19 +63,12 @@ pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
     if !n.opt.is_empty() && n.is_grant {
         e.line(LineType::SoftOrSpace);
         e.token(TokenKind::WITH_KW);
-        let mut first = true;
-        for opt in &n.opt {
+        e.space();
+        emit_grant_list(e, &n.opt, |opt, e| {
             if let Some(NodeEnum::DefElem(def)) = opt.node.as_ref() {
-                if first {
-                    e.space();
-                    first = false;
-                } else {
-                    e.token(TokenKind::COMMA);
-                    e.line(LineType::SoftOrSpace);
-                }
                 emit_grant_role_option(e, def);
             }
-        }
+        });
     }
 
     // GRANTED BY
@@ -109,6 +101,7 @@ pub(super) fn emit_grant_role_stmt(e: &mut EventEmitter, n: &GrantRoleStmt) {
         }
     }
 
-    e.token(TokenKind::SEMICOLON);
+    e.indent_end();
+
     e.group_end();
 }

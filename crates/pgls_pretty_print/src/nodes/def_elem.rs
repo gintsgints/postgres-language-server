@@ -105,7 +105,7 @@ pub(super) fn emit_options_def_elem(e: &mut EventEmitter, n: &DefElem) {
 }
 
 /// Emit role options for GRANT...WITH syntax
-/// Uses `NAME TRUE` / `NAME FALSE` syntax for INHERIT, SET, ADMIN
+/// Uses `NAME TRUE` / `NAME FALSE` syntax for INHERIT, SET, ADMIN, except `ADMIN OPTION`.
 pub(super) fn emit_grant_role_option(e: &mut EventEmitter, n: &DefElem) {
     e.group_start(GroupKind::DefElem);
 
@@ -122,19 +122,17 @@ pub(super) fn emit_grant_role_option(e: &mut EventEmitter, n: &DefElem) {
         }
     });
 
-    // Emit the option name in uppercase
-    let opt_name = match defname {
-        "admin" => "ADMIN",
-        "inherit" => "INHERIT",
-        "set" => "SET",
-        _ => &defname.to_uppercase(),
-    };
-    e.token(TokenKind::IDENT(opt_name.to_string()));
+    // Emit the option name
+    super::emit_keyword(e, defname);
 
     // Emit TRUE or FALSE
     if let Some(val) = is_true {
         e.space();
-        if val {
+        // `admin option` and `admin true` parse the same, but Postgres 15 and older only accept
+        // `with admin option`.
+        if val && defname.eq_ignore_ascii_case("admin") {
+            e.token(TokenKind::OPTION_KW);
+        } else if val {
             e.token(TokenKind::TRUE_KW);
         } else {
             e.token(TokenKind::FALSE_KW);
@@ -299,7 +297,7 @@ pub(super) fn emit_role_option(e: &mut EventEmitter, n: &DefElem) {
         _ => {
             // Fallback for unknown role options
             if !n.defname.is_empty() {
-                e.token(TokenKind::IDENT(n.defname.to_uppercase()));
+                super::emit_keyword(e, &n.defname);
             }
             if let Some(ref arg) = n.arg {
                 e.space();
